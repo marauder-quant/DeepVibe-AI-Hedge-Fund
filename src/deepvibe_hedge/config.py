@@ -4,10 +4,13 @@ MAD / MRAT standalone configuration (data pipeline, splitter, strategy, live).
 Typical flow
 ------------
 1. Set universe, bar size, and date range below.
-2. ``PYTHONPATH=src python -m deepvibe_hedge.alpaca_fetcher``
-3. ``PYTHONPATH=src python -m deepvibe_hedge.data_splitter``
+2. ``PYTHONPATH=src python -m deepvibe_hedge.alpaca_fetcher`` → writes
+   ``<project>/data/ohlcv/{TICKER}_{gran}.db`` and ``.csv`` (``data/`` is gitignored but present on disk).
+3. ``PYTHONPATH=src python -m deepvibe_hedge.data_splitter`` → updates those DBs/CSVs in place (splits + SMAs).
 4. ``PYTHONPATH=src python -m deepvibe_hedge.mad.backtester``
 5. Live: ``PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot`` (after OHLCV is current).
+
+Inspect OHLCV: ``PYTHONPATH=src python -m deepvibe_hedge.db_utils`` (overview of all DBs under ``data/ohlcv/``).
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from deepvibe_hedge.nasdaq100 import nasdaq100
 
 MAD_UNIVERSE_TICKERS = nasdaq100
 
-TARGET_TICKER = "BIL"
+TARGET_TICKER = "QQQ"
 
 OHLCV_PIPELINE_MODE = "mad_universe"  # "mad_universe" | "target_only"
 
@@ -83,42 +86,22 @@ LIVE_BOT_PAPER = True
 LIVE_BOT_ALLOW_SHORT = True
 
 # -----------------------------------------------------------------------------
-# Data splitter (walk-forward splits + indicator precompute on OHLCV SQLite)
+# Data splitter (walk-forward splits + SMA precompute on OHLCV SQLite)
+#
+# Split 0 = warmup so the longest SMA in ``splitter_ma_periods()`` is valid on the first bar of split 1.
+# SMA periods are derived from MAD grids (see ``splitter_ma_periods`` at end of this file).
 # -----------------------------------------------------------------------------
 
 SPLITTER_NUM_SPLITS = 10
 
-SPLITTER_MA_START = 2
-SPLITTER_MA_STOP = 256
-SPLITTER_MA_STEP = 2
-
-SPLITTER_DONCHIAN_START = 2
-SPLITTER_DONCHIAN_STOP = 200
-SPLITTER_DONCHIAN_STEP = 1
-
-SPLITTER_ADX_START = 14
-SPLITTER_ADX_STOP = 14
-SPLITTER_ADX_STEP = 1
-
 SPLITTER_ENABLE_SPLIT_ASSIGNMENT = True
 SPLITTER_ENABLE_MA_PRECOMPUTE = True
-SPLITTER_ENABLE_DONCHIAN_PRECOMPUTE = True
-SPLITTER_ENABLE_ADX_PRECOMPUTE = True
-
-SPLITTER_MIN_WARMUP_DAYS = 0
 
 SPLITTER_DB_WRITE_RETRIES = 6
 SPLITTER_DB_WRITE_RETRY_SEC = 5
 
 SPLIT_PLAN_IN_SAMPLE = (1, 3, 5, 7, 9)
 SPLIT_PLAN_OUT_OF_SAMPLE = (2, 4, 6, 8, 10)
-
-# Optional daily regime SMA columns (off for MAD-only installs; splitter skips when False).
-MOD_DONCHAIAN_DAILY_SMA_REGIME_ENABLED = False
-MOD_DONCHAIAN_DAILY_SMA_DAYS_START = 2
-MOD_DONCHAIAN_DAILY_SMA_DAYS_STOP = 200
-MOD_DONCHAIAN_DAILY_SMA_DAYS_STEP = 10
-MOD_DONCHAIAN_DAILY_SMA_WARMUP_EXTRA_CALENDAR_DAYS = 5
 
 # -----------------------------------------------------------------------------
 # MAD / MRAT
@@ -190,6 +173,19 @@ MAD_LIVE_REFRESH_SPLITTER_DB = False
 MAD_LIVE_REFRESH_SPLITTER_ONCE_PER_UTC_DAY = True
 MAD_LIVE_REFRESH_SPLITTER_ON_STARTUP = True
 
+# When True, ``compute_mad_live_snapshot`` uses ``sma_<n>`` columns from OHLCV SQLite (from
+# ``data_splitter``) for MRAT ma_s/ma_l (and exit SMA when present). Falls back to rolling close
+# if columns are missing. Regime uses precomputed SMA only for ``TARGET_CANDLE_GRANULARITY`` 1d
+# (intraday DB SMAs are not the same as daily regime MA).
+MAD_LIVE_USE_PRECOMPUTED_SMA = True
+
+# After each live cycle (non-dry-run), pull missing daily bars from Alpaca into ``data/ohlcv/*.db``,
+# recompute ``split``, and set ``sma_21`` + ``sma_200`` on universe names; regime ETF (``MAD_REGIME_TICKER``
+# / ``QQQ``) gets ``sma_200`` only (``sma_21`` cleared). Requires existing DBs (run fetcher first).
+# Only active when ``TARGET_CANDLE_GRANULARITY`` is ``1d``.
+MAD_LIVE_APPEND_DAILY_OHLCV = True
+MAD_LIVE_APPEND_SLEEP_SEC = 0.05
+
 MAD_LIVE_EXTENDED_HOURS_ORDERS = True
 MAD_LIVE_REGIME_OFF_PROXY_TICKER = "BIL"
 MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY = True
@@ -197,3 +193,29 @@ MAD_LIVE_REGIME_OFF_EQUITY_FRACTION = 0.995
 
 MAD_LIVE_ALPACA_CONNECT_RETRIES = 5
 MAD_LIVE_ALPACA_CONNECT_RETRY_SEC = 2.0
+
+
+def splitter_ma_periods() -> tuple[int, ...]:
+    """
+    SMA lookbacks written to each OHLCV DB (``sma_<n>`` only).
+
+    Union of MRAT short/long grids, positive exit-MA grid, positive regime-MA grid, and live regime MA
+    when set — matches what the backtest grid and live snapshot may use.
+    """
+    periods: set[int] = set()
+    for grid in (MAD_SMA_SHORT_GRID, MAD_SMA_LONG_GRID):
+        periods.update(int(x) for x in grid)
+    periods.update(int(x) for x in MAD_EXIT_MA_GRID if int(x) > 0)
+    periods.update(int(x) for x in MAD_REGIME_MA_GRID if int(x) > 0)
+    live_r = MAD_LIVE_REGIME_MA
+    if live_r is not None and int(live_r) > 0:
+        periods.add(int(live_r))
+    ordered = sorted(periods)
+    if not ordered:
+        raise ValueError("splitter_ma_periods(): empty — set MAD_SMA_*_GRID and related grids.")
+    return tuple(ordered)
+
+
+def splitter_warmup_min_calendar_days() -> int:
+    """Distinct calendar days kept in split 0 (with MA precompute) — equals longest SMA period."""
+    return max(splitter_ma_periods())

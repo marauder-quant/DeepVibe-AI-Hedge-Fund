@@ -3,17 +3,23 @@ Live Alpaca bot for MAD / MRAT (equal-weight panel from local OHLCV SQLite).
 
 Reads the same ``data/ohlcv/*.db`` files as ``mad.backtester`` (run ``alpaca_fetcher`` first so closes
 are current). Optional ``MAD_LIVE_OHLCV_*`` checks staleness vs the reference ticker; optional
-``MAD_LIVE_REFRESH_SPLITTER_DB`` re-runs ``data_splitter`` once per UTC day so ``sma_*`` (and other
-precompute columns) match a manual splitter run. MRAT signals use **closes**, not those columns.
+``MAD_LIVE_REFRESH_SPLITTER_DB`` re-runs ``data_splitter`` so ``sma_*`` stay in sync. When
+``MAD_LIVE_USE_PRECOMPUTED_SMA`` is True (default), the live snapshot reads those columns for
+MRAT (and regime on **1d** bars); otherwise it rolls SMAs from **close** only.
 
 Parameters default to the ``summary`` table in ``{MAD_DATA_DIR}/{ref}_{gran}_mad_optim.db`` when
 ``MAD_LIVE_LOAD_PARAMS_FROM_DB`` is True.
 
 ``MAD_LIVE_REGIME_OFF_PROXY_TICKER`` (e.g. BIL): when regime is risk-off (e.g. QQQ below its SMA),
 ``MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY`` can flatten the whole account into that sleeve using
-``MAD_LIVE_REGIME_OFF_EQUITY_FRACTION`` of equity. Fetch OHLCV for the sleeve (include in pipeline).
+``MAD_LIVE_REGIME_OFF_EQUITY_FRACTION`` of equity. The sleeve is treated as cash-like: no OHLCV DB or
+splitter work; order sizing uses an Alpaca **market quote** only.
 For after-hours tests: set ``MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False`` and
 ``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``.
+
+With ``MAD_LIVE_APPEND_DAILY_OHLCV`` (default True), each non-dry-run cycle **starts** by appending new
+``1d`` bars from Alpaca into ``data/ohlcv/*.db`` and refreshing ``sma_21``/``sma_200`` (regime ETF:
+``sma_200`` only), then runs MRAT on the updated DB.
 
 Usage:
     PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --dry-run
@@ -53,6 +59,7 @@ from deepvibe_hedge.alpaca_live import (
 )
 from deepvibe_hedge.data_splitter import run_pipeline_for_ticker
 from deepvibe_hedge.mad.ohlcv_health import audit_mad_ohlcv_panel, print_health_report
+from deepvibe_hedge.ohlcv_live_append import append_latest_daily_for_universe, summarize_append_status
 from deepvibe_hedge.paths import MAD_DATA_DIR, OHLCV_DIR
 
 _LAST_SPLITTER_REFRESH_UTC_DATE: date | None = None
@@ -170,7 +177,7 @@ def _maybe_refresh_splitter_dbs(*, force: bool = False) -> None:
         return
     syms = tuple(config.ohlcv_pipeline_tickers())
     print(
-        f"\n[MAD live] Splitter refresh: {len(syms)} symbol(s) → SMA/Donchian/ADX + splits written to OHLCV DBs..."
+        f"\n[MAD live] Splitter refresh: {len(syms)} symbol(s) → SMA columns + splits written to OHLCV DBs..."
     )
     failed: list[tuple[str, str]] = []
     for sym in syms:
@@ -202,11 +209,6 @@ def _run_ohlcv_health_check(reg_ma: int, reg_tick: str | None) -> None:
         et = _display_regime_ticker(rma, reg_tick)
         if et != "off":
             extra.append(et)
-    proxy = getattr(config, "MAD_LIVE_REGIME_OFF_PROXY_TICKER", None)
-    if proxy:
-        ps = str(proxy).strip().upper()
-        if ps:
-            extra.append(ps)
     report = audit_mad_ohlcv_panel(
         ohlcv_dir=OHLCV_DIR,
         granularity=str(config.TARGET_CANDLE_GRANULARITY),
@@ -270,6 +272,14 @@ def _last_close_from_ohlcv_db(symbol: str) -> float:
     if not row or row[0] is None:
         return float("nan")
     return float(row[0])
+
+
+def _sleeve_market_price(symbol: str, *, paper: bool) -> float:
+    """Regime sleeve (e.g. BIL): no OHLCV pipeline — quote from Alpaca for sizing/limits only."""
+    try:
+        return _latest_stock_trade_price(str(symbol).strip().upper(), paper=paper)
+    except Exception:
+        return float("nan")
 
 
 def _px_for_reconcile(
@@ -346,6 +356,15 @@ def _run_cycle(
     min_order_usd: float,
     paper: bool = True,
 ) -> None:
+    if not dry_run and bool(getattr(config, "MAD_LIVE_APPEND_DAILY_OHLCV", True)):
+        try:
+            st = append_latest_daily_for_universe(quiet=True)
+            summ = summarize_append_status(st)
+            if summ:
+                print(f"[ohlcv_append] {summ}")
+        except Exception as exc:
+            print(f"[ohlcv_append] ERROR: {exc}")
+
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
     sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
     snap = compute_mad_live_snapshot(
@@ -400,14 +419,12 @@ def _run_cycle(
             leg = ex_gross * abs(w)
             print(f"    {t:6s} w={w:+.4f} close={px:.4f} leg≈${leg:,.0f}")
         if proxy_sym:
-            pxp = _last_close_from_ohlcv_db(proxy_sym)
             re_frac = float(getattr(config, "MAD_LIVE_REGIME_OFF_EQUITY_FRACTION", 0.995))
             ex_sleeve = ex_gross * re_frac if use_bil_sleeve else 0.0
-            bil_q = _desired_shares_signed(1.0, ex_sleeve, pxp) if use_bil_sleeve else 0
             print(
                 f"    {proxy_sym:6s} sleeve {'ON' if use_bil_sleeve else 'off'} "
-                f"close={pxp:.4f} shares≈{bil_q:+d} @ ${ex_sleeve:,.0f} regime-off notional "
-                f"(close_all_non_proxy={close_all_np})"
+                f"@ ${ex_sleeve:,.0f} regime-off notional (no OHLCV; size with Alpaca quote when live) | "
+                f"close_all_non_proxy={close_all_np}"
             )
         return
 
@@ -465,23 +482,24 @@ def _run_cycle(
                 )
 
     if proxy_sym:
-        bil_px = _last_close_from_ohlcv_db(proxy_sym)
+        bil_px = _sleeve_market_price(proxy_sym, paper=paper)
         if use_bil_sleeve:
             bil_usd = float(sleeve_notional)
             if bil_usd < float(min_order_usd):
                 bil_desired = 0
                 bil_note = f" | skipped sleeve ${bil_usd:.2f} < min_order"
             else:
-                bil_desired = _desired_shares_signed(1.0, gross, bil_px)
+                bil_desired = _desired_shares_signed(1.0, bil_usd, bil_px)
                 bil_note = ""
         else:
             bil_desired = 0
             bil_note = ""
         bil_cur = int(round(_get_current_qty(trading_client, proxy_sym)))
         if bil_desired != bil_cur or bil_note:
+            px_disp = f"{bil_px:.4f}" if np.isfinite(bil_px) and bil_px > 0 else "market"
             print(
                 f"  {proxy_sym}: sleeve={'risk-off full gross' if use_bil_sleeve else 'flat'} "
-                f"px={bil_px:.4f} desired_net={bil_desired:+d} current={bil_cur:+d}{bil_note}"
+                f"quote={px_disp} desired_net={bil_desired:+d} current={bil_cur:+d}{bil_note}"
             )
         if bil_desired != bil_cur:
             _reconcile_symbol_net_qty(
@@ -489,7 +507,7 @@ def _run_cycle(
                 proxy_sym,
                 bil_desired,
                 extended_hours=ext_hrs,
-                reference_price=bil_px if ext_hrs else None,
+                reference_price=bil_px if ext_hrs and np.isfinite(bil_px) and bil_px > 0 else None,
                 paper=paper,
             )
 

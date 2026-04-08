@@ -1,4 +1,11 @@
-"""Data directories under the project ``data/`` tree (OHLCV SQLite, MAD optimiser outputs)."""
+"""
+Data directories under the project ``data/`` tree.
+
+- ``OHLCV_DIR``: ``<repo>/data/ohlcv/{SYMBOL}_{granularity}.db`` and matching ``.csv`` from
+  ``alpaca_fetcher`` / ``data_splitter``. The whole ``data/`` tree is gitignored (see ``.gitignore``);
+  files are created on first fetch.
+- ``MAD_DATA_DIR``: backtest / optimiser SQLite outputs.
+"""
 from __future__ import annotations
 
 from pathlib import Path

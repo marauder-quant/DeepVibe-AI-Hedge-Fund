@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,15 +95,32 @@ def _normalize_direction_mode(raw: str | None) -> str:
     return aliases[mode]
 
 
-def _load_one_ohlcv(db_path: Path) -> pd.DataFrame:
+def _load_one_ohlcv(
+    db_path: Path,
+    *,
+    sma_periods: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
     if not db_path.exists():
         raise FileNotFoundError(f"OHLCV DB not found: {db_path}")
     with sqlite3.connect(db_path) as con:
         cols = [row[1] for row in con.execute("PRAGMA table_info(ohlcv)").fetchall()]
-        wanted = [c for c in ("timestamp", "open", "close", "split") if c in cols]
+        colset = set(cols)
+        wanted = [c for c in ("timestamp", "open", "close", "split") if c in colset]
         if "timestamp" not in wanted or "close" not in wanted:
             raise RuntimeError(f"{db_path} missing timestamp/close on ohlcv table.")
-        df = pd.read_sql(f"SELECT {', '.join(wanted)} FROM ohlcv", con, parse_dates=["timestamp"])
+        extra: list[str] = []
+        if sma_periods:
+            for p in sma_periods:
+                c = f"sma_{int(p)}"
+                if c in colset:
+                    extra.append(c)
+        extra = sorted(set(extra), key=lambda x: int(x.split("_")[1]))
+        select_cols = wanted + extra
+        df = pd.read_sql(
+            f"SELECT {', '.join(select_cols)} FROM ohlcv",
+            con,
+            parse_dates=["timestamp"],
+        )
     df = df.set_index("timestamp").sort_index()
     df.index = pd.to_datetime(df.index, utc=True)
     if "open" not in df.columns:
@@ -117,9 +135,11 @@ def build_panel_long(
     granularity: str,
     reference_ticker: str,
     ohlcv_dir: Path,
+    *,
+    include_sma_periods: tuple[int, ...] | None = None,
 ) -> pd.DataFrame:
     ref_path = ohlcv_dir / f"{reference_ticker}_{granularity}.db"
-    ref = _load_one_ohlcv(ref_path)
+    ref = _load_one_ohlcv(ref_path, sma_periods=None)
     ref_idx = ref.index
     rows: list[pd.DataFrame] = []
     missing: list[str] = []
@@ -128,7 +148,7 @@ def build_panel_long(
         if not p.exists():
             missing.append(t)
             continue
-        df = _load_one_ohlcv(p)
+        df = _load_one_ohlcv(p, sma_periods=include_sma_periods)
         aligned = df.reindex(ref_idx)
         sub = pd.DataFrame(
             {
@@ -139,6 +159,9 @@ def build_panel_long(
                 "split": ref["split"].to_numpy(),
             }
         )
+        for c in aligned.columns:
+            if c.startswith("sma_") and c not in sub.columns:
+                sub[c] = aligned[c].to_numpy()
         sub = sub.dropna(subset=["close"])
         rows.append(sub)
     if missing:
@@ -229,15 +252,19 @@ def _build_regime_allow(
 
 
 def aggregate_panel_to_daily(panel_long: pd.DataFrame) -> pd.DataFrame:
-    """Last close / first open per calendar day (UTC); split from last bar of day."""
+    """Last close / first open per calendar day (UTC); split from last bar of day; last precomputed SMA."""
     df = panel_long.copy()
     df["day"] = df["timestamp"].dt.normalize()
     g = df.groupby(["day", "ticker"], sort=True)
-    daily = g.agg(
-        open=("open", "first"),
-        close=("close", "last"),
-        split=("split", "last"),
-    ).reset_index()
+    agg_kw: dict[str, tuple[str, str]] = {
+        "open": ("open", "first"),
+        "close": ("close", "last"),
+        "split": ("split", "last"),
+    }
+    for c in df.columns:
+        if c.startswith("sma_"):
+            agg_kw[c] = (c, "last")
+    daily = g.agg(**agg_kw).reset_index()
     daily = daily.rename(columns={"day": "date"})
     return daily
 
@@ -294,6 +321,7 @@ def compute_mrat_panel(
     long_decile_min: int | None = None,
     short_decile_max: int | None = None,
     symmetric_short_sigma: bool | None = None,
+    prefer_precomputed_sma: bool = False,
 ) -> pd.DataFrame:
     """Adds mrat, sigma, decile, signal, entry_signal, daily_ret per row.
 
@@ -333,8 +361,19 @@ def compute_mrat_panel(
     sd_max = max(1, min(10, sd_max))
     dm = _normalize_direction_mode(direction_mode)
     df = daily_long.sort_values(["ticker", "date"]).copy()
-    df["ma_s"] = df.groupby("ticker", sort=False)["close"].transform(lambda s: _sma(s, short_w))
-    df["ma_l"] = df.groupby("ticker", sort=False)["close"].transform(lambda s: _sma(s, long_w))
+    cs, cl = f"sma_{int(short_w)}", f"sma_{int(long_w)}"
+    if (
+        prefer_precomputed_sma
+        and cs in df.columns
+        and cl in df.columns
+        and df[cs].notna().any()
+        and df[cl].notna().any()
+    ):
+        df["ma_s"] = df[cs].astype(float)
+        df["ma_l"] = df[cl].astype(float)
+    else:
+        df["ma_s"] = df.groupby("ticker", sort=False)["close"].transform(lambda s: _sma(s, short_w))
+        df["ma_l"] = df.groupby("ticker", sort=False)["close"].transform(lambda s: _sma(s, long_w))
     df["mrat"] = df["ma_s"] / df["ma_l"]
     hist_n = df.groupby("ticker", sort=False).cumcount() + 1
     ok = (
@@ -377,9 +416,13 @@ def compute_mrat_panel(
     df["signal"] = df["signal"].fillna(0).astype(int)
     ex_n = int(exit_ma_period or 0)
     if ex_n > 0:
-        df["mad_exit_ma_level"] = df.groupby("ticker", sort=False)["close"].transform(
-            lambda s: _sma(s, ex_n)
-        )
+        cex = f"sma_{ex_n}"
+        if prefer_precomputed_sma and cex in df.columns and df[cex].notna().any():
+            df["mad_exit_ma_level"] = df[cex].astype(float)
+        else:
+            df["mad_exit_ma_level"] = df.groupby("ticker", sort=False)["close"].transform(
+                lambda s: _sma(s, ex_n)
+            )
         long_m = df["signal"].to_numpy(dtype=int) == 1
         c = df["close"].to_numpy(dtype=float)
         mx = df["mad_exit_ma_level"].to_numpy(dtype=float)
@@ -427,12 +470,45 @@ class MadLiveSnapshot:
     n_short: int
 
 
+def _regime_risk_on_from_db_precomputed(
+    sym: str,
+    granularity: str,
+    ohlcv_dir: Path,
+    w: int,
+) -> bool | None:
+    """
+    Last row: close vs splitter ``sma_<w>``. Only valid when OHLCV granularity is daily (see caller).
+    Returns None if column missing or values non-finite.
+    """
+    path = ohlcv_dir / f"{str(sym).strip().upper()}_{granularity}.db"
+    if not path.exists():
+        return None
+    col = f"sma_{int(w)}"
+    if not re.fullmatch(r"sma_[0-9]+", col):
+        return None
+    with sqlite3.connect(path) as con:
+        names = [r[1] for r in con.execute("PRAGMA table_info(ohlcv)").fetchall()]
+        if col not in names:
+            return None
+        row = con.execute(
+            f"SELECT close, {col} AS sx FROM ohlcv ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    c, s = float(row[0]), float(row[1])
+    if not (np.isfinite(c) and np.isfinite(s)):
+        return None
+    return bool(c > s)
+
+
 def _regime_risk_on_for_next_session(
     regime_ma_period: int,
     regime_ticker: str | None,
     granularity: str,
     aggregate_to_daily: bool,
     ohlcv_dir: Path,
+    *,
+    prefer_precomputed_sma: bool = False,
 ) -> bool:
     """
     After the last regime close in SQLite, is the next session risk-on?
@@ -444,9 +520,14 @@ def _regime_risk_on_for_next_session(
     if int(regime_ma_period or 0) <= 0:
         return True
     sym = (regime_ticker or "").strip().upper() or (mad_regime_ticker_symbol() or "QQQ")
+    w = int(regime_ma_period)
+    gran_lc = str(granularity).strip().lower()
+    if prefer_precomputed_sma and gran_lc == "1d":
+        pc = _regime_risk_on_from_db_precomputed(sym, granularity, ohlcv_dir, w)
+        if pc is not None:
+            return pc
     close = _load_regime_daily_close(sym, granularity, ohlcv_dir, aggregate_to_daily=aggregate_to_daily)
     close = close.sort_index()
-    w = int(regime_ma_period)
     if len(close) < w:
         return False
     sma = _sma(close, w)
@@ -470,6 +551,11 @@ def compute_mad_live_snapshot(
 
     Uses the **last** panel date's ``signal`` (not ``entry_signal``): that is the book to hold for the
     session after that close, consistent with ``entry_signal`` shifting by one bar in the backtest.
+
+    When ``config.MAD_LIVE_USE_PRECOMPUTED_SMA`` is True, loads ``sma_<short>``, ``sma_<long>``, and
+    optional ``sma_<exit>`` from each symbol DB (run ``data_splitter`` after fetch). MRAT then matches
+    the splitter-rounded SMAs. Missing columns fall back to rolling ``close``. Regime precomputed path
+    applies only for ``TARGET_CANDLE_GRANULARITY`` ``1d``.
     """
     odir = ohlcv_dir or OHLCV_DIR
     ref = mad_reference_ticker()
@@ -477,8 +563,18 @@ def compute_mad_live_snapshot(
     gran = str(config.TARGET_CANDLE_GRANULARITY)
     daily_agg = bool(getattr(config, "MAD_AGGREGATE_TO_DAILY", True)) and gran.lower() != "1d"
     dm = direction_mode if direction_mode is not None else getattr(config, "MAD_DIRECTION_MODE", "both")
+    use_pc = bool(getattr(config, "MAD_LIVE_USE_PRECOMPUTED_SMA", True))
+    sma_periods: tuple[int, ...] | None = None
+    if use_pc:
+        ps = {int(short_w), int(long_w)}
+        ex = int(exit_ma_period or 0)
+        if ex > 0:
+            ps.add(ex)
+        sma_periods = tuple(sorted(ps))
 
-    panel_long = build_panel_long(universe, gran, ref, odir)
+    panel_long = build_panel_long(
+        universe, gran, ref, odir, include_sma_periods=sma_periods
+    )
     if daily_agg:
         daily_long = aggregate_panel_to_daily(panel_long)
     else:
@@ -497,6 +593,7 @@ def compute_mad_live_snapshot(
         min_names=min_names,
         direction_mode=str(dm),
         exit_ma_period=int(exit_ma_period or 0),
+        prefer_precomputed_sma=use_pc,
     )
     if panel.empty or panel["date"].isna().all():
         raise RuntimeError("MAD panel is empty; check OHLCV DBs and universe.")
@@ -520,6 +617,7 @@ def compute_mad_live_snapshot(
         gran,
         daily_agg,
         odir,
+        prefer_precomputed_sma=use_pc,
     )
     if regime_ok:
         w = _weights_from_entries(sig_series)

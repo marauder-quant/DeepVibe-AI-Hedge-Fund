@@ -131,7 +131,62 @@ def fetch_ohlcv(symbol: str, client: StockHistoricalDataClient | None = None) ->
     return df[cols].sort_index()
 
 
+def fetch_ohlcv_between(
+    symbol: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    client: StockHistoricalDataClient | None = None,
+) -> pd.DataFrame:
+    """Historical bars for ``[start_utc, end_utc)`` (Alpaca semantics); same feed/adjustment as bulk fetch."""
+    sym = str(symbol).strip().upper()
+    client = client or _make_client()
+    timeframe = _parse_timeframe(config.TARGET_CANDLE_GRANULARITY)
+    raw_feed = str(getattr(config, "LIVE_BOT_DATA_FEED", "iex")).strip().lower()
+    feed = {
+        "iex": DataFeed.IEX,
+        "sip": DataFeed.SIP,
+        "delayed_sip": DataFeed.DELAYED_SIP,
+    }.get(raw_feed, DataFeed.IEX)
+    adj = historical_bar_adjustment()
+    s = start_utc if start_utc.tzinfo else start_utc.replace(tzinfo=timezone.utc)
+    e = end_utc if end_utc.tzinfo else end_utc.replace(tzinfo=timezone.utc)
+    req = StockBarsRequest(
+        symbol_or_symbols=sym,
+        timeframe=timeframe,
+        start=s,
+        end=e,
+        feed=feed,
+        adjustment=adj,
+    )
+    try:
+        df = client.get_stock_bars(req).df
+    except APIError as exc:
+        if "subscription does not permit querying recent sip data" in str(exc).lower() and feed != DataFeed.IEX:
+            fallback_req = StockBarsRequest(
+                symbol_or_symbols=sym,
+                timeframe=timeframe,
+                start=s,
+                end=e,
+                feed=DataFeed.IEX,
+                adjustment=adj,
+            )
+            df = client.get_stock_bars(fallback_req).df
+        else:
+            raise
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return pd.DataFrame()
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.xs(sym, level="symbol")
+    df.index = pd.to_datetime(df.index, utc=True)
+    cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+    return df[cols].sort_index()
+
+
 if __name__ == "__main__":
+    from deepvibe_hedge.paths import ensure_data_dirs
+
+    ensure_data_dirs()
     symbols = config.ohlcv_pipeline_tickers()
     _adj = historical_bar_adjustment()
     _end = config.ohlcv_download_end_utc()
