@@ -65,7 +65,7 @@ def _alpaca_trading_keys(*, paper: bool) -> tuple[str, str]:
 
 def trading_client_for_assets(*, paper: bool | None = None) -> TradingClient:
     if paper is None:
-        paper = bool(getattr(config, "LIVE_BOT_PAPER", True))
+        paper = config.bot_mode_is_paper()
     key, secret = _alpaca_trading_keys(paper=paper)
     return TradingClient(api_key=key, secret_key=secret, paper=paper)
 

@@ -2,6 +2,10 @@
   <img src="deepvibe2.png" alt="DeepVibe AI Hedge Fund" width="480">
 </p>
 
+<p align="center">
+  <img src="Deepvibe_results_backtest.PNG" alt="DeepVibe backtest results" width="900">
+</p>
+
 # DeepVibe AI Hedge Fund
 
 Standalone **MAD / MRAT** cross-sectional equity research stack: download daily OHLCV from **Alpaca**, store it in **SQLite**, assign walk-forward **splits**, run a **panel backtest** with optional **QQQ regime** filtering, and trade the same logic on **Alpaca** via the **live bot**.

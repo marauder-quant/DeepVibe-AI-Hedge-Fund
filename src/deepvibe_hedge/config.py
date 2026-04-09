@@ -81,8 +81,22 @@ BACKTEST_FEE_RATE = 0.001
 
 # Alpaca market data feed for historical bars (``alpaca_fetcher``).
 LIVE_BOT_DATA_FEED = "iex"
-# Paper vs live key resolution fallbacks (``alpaca_asset``, ``alpaca_live``).
-LIVE_BOT_PAPER = True
+# Alpaca account: ``paper`` = paper API; ``cash`` = live brokerage (real money). Optional alias: ``live``.
+BOT_MODE = "cash"
+
+
+def bot_mode_is_paper() -> bool:
+    """True if ``BOT_MODE`` selects Alpaca paper trading; False for live (``cash`` / ``live``)."""
+    m = str(globals().get("BOT_MODE", "paper")).strip().lower()
+    if m == "paper":
+        return True
+    if m in ("cash", "live"):
+        return False
+    raise ValueError(
+        f"Invalid BOT_MODE={m!r}. Use 'paper' or 'cash' (alias 'live' for live account)."
+    )
+
+
 LIVE_BOT_ALLOW_SHORT = True
 
 # -----------------------------------------------------------------------------
@@ -148,7 +162,6 @@ MAD_PERM_PORT = 8065
 MAD_PERM_OPTIM_SPLIT = "avg"
 MAD_PERM_IS_SPLITS = MAD_IS_SPLITS
 
-MAD_LIVE_PAPER = True
 MAD_LIVE_POLL_SECONDS = 300
 MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False
 MAD_LIVE_LOAD_PARAMS_FROM_DB = True
@@ -162,6 +175,15 @@ MAD_LIVE_REGIME_TICKER = None
 MAD_LIVE_EQUITY_FRACTION = 0.98
 MAD_LIVE_MAX_GROSS_USD = None
 MAD_LIVE_MIN_ORDER_USD = 1.0
+# Alpaca supports fractional ``qty`` on market/limit DAY orders (incl. many extended-hours limits).
+# True → equal-dollar MRAT targets as share floats (matches backtest); False → whole-share ``floor``.
+MAD_LIVE_FRACTIONAL_SHARES = True
+
+# Before submitting a reconcile delta for a symbol, cancel all **open** Alpaca orders for that symbol
+# (avoids stacking duplicate DAY limits across poll passes). Filled positions are unchanged; next
+# cycle still places a new order if desired ≠ filled qty. Set False if you place manual working orders
+# on the same symbols as the bot.
+MAD_LIVE_CANCEL_OPEN_BEFORE_RECONCILE = True
 
 MAD_LIVE_OHLCV_HEALTH_CHECK = True
 MAD_LIVE_HEALTH_REFERENCE_TICKER = None
@@ -187,6 +209,10 @@ MAD_LIVE_APPEND_DAILY_OHLCV = True
 MAD_LIVE_APPEND_SLEEP_SEC = 0.05
 
 MAD_LIVE_EXTENDED_HOURS_ORDERS = True
+# When False (default), extended-hours **limit** price is anchored to live **ask** (buys) / **bid**
+# (sells), then ``alpaca_live._extended_hours_limit_price`` applies the ±1% cushion — not MRAT's
+# daily bar close (which is stale vs after-hours prints). Set True only to restore old behavior.
+MAD_LIVE_EXT_HRS_LIMIT_FROM_DAILY_CLOSE = False
 MAD_LIVE_REGIME_OFF_PROXY_TICKER = "BIL"
 MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY = True
 MAD_LIVE_REGIME_OFF_EQUITY_FRACTION = 0.995

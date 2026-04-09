@@ -15,7 +15,9 @@ Parameters default to the ``summary`` table in ``{MAD_DATA_DIR}/{ref}_{gran}_mad
 ``MAD_LIVE_REGIME_OFF_EQUITY_FRACTION`` of equity. The sleeve is treated as cash-like: no OHLCV DB or
 splitter work; order sizing uses an Alpaca **market quote** only.
 For after-hours tests: set ``MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False`` and
-``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``.
+``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``. Extended-hours **limit** prices default to a live
+**ask/bid** anchor (see ``MAD_LIVE_EXT_HRS_LIMIT_FROM_DAILY_CLOSE``); printed ``px=`` is still MRAT's
+daily close for sizing context.
 
 With ``MAD_LIVE_APPEND_DAILY_OHLCV`` (default True), each non-dry-run cycle **starts** by appending new
 ``1d`` bars from Alpaca into ``data/ohlcv/*.db`` and refreshing ``sma_21``/``sma_200`` (regime ETF:
@@ -56,6 +58,7 @@ from deepvibe_hedge.alpaca_live import (
     _latest_stock_trade_price,
     _market_is_open,
     _reconcile_symbol_net_qty,
+    _round_alpaca_qty,
 )
 from deepvibe_hedge.data_splitter import run_pipeline_for_ticker
 from deepvibe_hedge.mad.ohlcv_health import audit_mad_ohlcv_panel, print_health_report
@@ -299,6 +302,27 @@ def _px_for_reconcile(
     return _latest_stock_trade_price(sym, paper=paper)
 
 
+def _fmt_net_qty(q: float | int, *, fractional: bool) -> str:
+    if fractional:
+        s = f"{float(q):+.6f}".rstrip("0").rstrip(".")
+        return s if s not in ("+", "-") else f"{float(q):+g}"
+    return f"{int(round(float(q))):+d}"
+
+
+def _desired_qty_signed(
+    weight: float, gross_usd: float, price: float, *, fractional: bool
+) -> float:
+    if not np.isfinite(price) or price <= 0.0:
+        return 0.0
+    usd = float(weight) * float(gross_usd)
+    if abs(usd) < 1e-9:
+        return 0.0
+    if fractional:
+        return float(math.copysign(round(abs(usd) / price, 6), usd))
+    mag = abs(usd) / price
+    return float(int(math.copysign(int(math.floor(mag)), usd)))
+
+
 def _flatten_account_except_proxy(
     trading_client: TradingClient,
     *,
@@ -306,6 +330,7 @@ def _flatten_account_except_proxy(
     close_by_ticker: dict[str, float],
     ext_hrs: bool,
     paper: bool,
+    fractional: bool,
 ) -> None:
     """Sell/cover every open position except the sleeve ETF (regime-off full pivot)."""
     px = proxy_sym.strip().upper()
@@ -313,40 +338,35 @@ def _flatten_account_except_proxy(
         sym = str(pos.symbol).strip().upper()
         if sym == px:
             continue
-        cur = int(round(float(pos.qty)))
-        if cur == 0:
+        cur_f = float(pos.qty)
+        cur = round(cur_f, 6) if fractional else int(round(cur_f))
+        if abs(float(cur)) < 1e-8 if fractional else cur == 0:
             continue
         ref_px = _px_for_reconcile(sym, close_by_ticker, paper=paper)
         desired = 0
         dq_clamped, short_note = _apply_live_short_constraints(
-            trading_client, sym, desired
+            trading_client, sym, desired, fractional=fractional
         )
+        cur_disp = _fmt_net_qty(cur, fractional=fractional)
+        tgt_disp = _fmt_net_qty(dq_clamped, fractional=fractional)
         print(
-            f"  {sym}: regime-off flatten px={ref_px:.4f} desired_net={dq_clamped:+d} current={cur:+d}"
+            f"  {sym}: regime-off flatten px={ref_px:.4f} desired_net={tgt_disp} current={cur_disp}"
             f"{short_note}"
         )
         if dq_clamped != desired:
             desired = dq_clamped
-        if desired != cur:
+        if (fractional and abs(float(desired) - float(cur)) >= 1e-8) or (
+            not fractional and int(desired) != int(cur)
+        ):
             _reconcile_symbol_net_qty(
                 trading_client,
                 sym,
                 desired,
                 extended_hours=ext_hrs,
-                reference_price=ref_px if ext_hrs else None,
+                reference_price=ref_px if (ext_hrs or fractional) else None,
                 paper=paper,
+                fractional=fractional,
             )
-
-
-def _desired_shares_signed(weight: float, gross_usd: float, price: float) -> int:
-    if not np.isfinite(price) or price <= 0.0:
-        return 0
-    usd = float(weight) * float(gross_usd)
-    if abs(usd) < 1e-9:
-        return 0
-    mag = abs(usd) / price
-    q = int(math.floor(mag))
-    return int(math.copysign(q, usd))
 
 
 def _run_cycle(
@@ -388,6 +408,7 @@ def _run_cycle(
         and getattr(config, "MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY", True)
     )
     ext_hrs = bool(getattr(config, "MAD_LIVE_EXTENDED_HOURS_ORDERS", False))
+    frac = bool(getattr(config, "MAD_LIVE_FRACTIONAL_SHARES", True))
 
     if not dry_run:
         assert trading_client is not None
@@ -408,6 +429,7 @@ def _run_cycle(
         f"  raw long / short : {snap.n_long} / {snap.n_short}\n"
         f"  regime sleeve    : {proxy_sym or 'cash'} (active={'yes' if use_bil_sleeve else 'no — MRAT book'})\n"
         f"  extended_hours   : {ext_hrs}\n"
+        f"  fractional_shares: {frac}\n"
     )
 
     if dry_run:
@@ -417,7 +439,11 @@ def _run_cycle(
             w = snap.weight_by_ticker.get(t, 0.0)
             px = snap.close_by_ticker.get(t, float("nan"))
             leg = ex_gross * abs(w)
-            print(f"    {t:6s} w={w:+.4f} close={px:.4f} leg≈${leg:,.0f}")
+            qtxt = ""
+            if frac and np.isfinite(px) and px > 0 and abs(w) > 1e-12:
+                dq = _desired_qty_signed(w, ex_gross, px, fractional=True)
+                qtxt = f"  qty≈{_fmt_net_qty(dq, fractional=True)}"
+            print(f"    {t:6s} w={w:+.4f} close={px:.4f} leg≈${leg:,.0f}{qtxt}")
         if proxy_sym:
             re_frac = float(getattr(config, "MAD_LIVE_REGIME_OFF_EQUITY_FRACTION", 0.995))
             ex_sleeve = ex_gross * re_frac if use_bil_sleeve else 0.0
@@ -445,6 +471,7 @@ def _run_cycle(
             close_by_ticker=snap.close_by_ticker,
             ext_hrs=ext_hrs,
             paper=paper,
+            fractional=frac,
         )
     else:
         for t in snap.tickers:
@@ -454,31 +481,73 @@ def _run_cycle(
             px = snap.close_by_ticker.get(t, float("nan"))
             leg_usd = abs(w) * gross
             if abs(w) > 1e-12 and leg_usd < float(min_order_usd):
-                desired = 0
+                desired = 0.0
                 note = f" | skipped leg ${leg_usd:.2f} < min_order"
             else:
-                desired = _desired_shares_signed(w, gross, px)
+                desired = _desired_qty_signed(w, gross, px, fractional=frac)
                 note = ""
 
-            cur = int(round(_get_current_qty(trading_client, t)))
-            if desired == 0 and cur == 0:
+            cur_f = float(_get_current_qty(trading_client, t))
+            cur = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
+            zero_pos = (
+                abs(float(desired)) < 1e-8 and abs(float(cur)) < 1e-8
+                if frac
+                else int(desired) == 0 and int(cur) == 0
+            )
+            if zero_pos:
+                if abs(w) > 1e-12:
+                    px_disp = f"{px:.4f}" if np.isfinite(px) and px > 0 else "nan"
+                    zd = _fmt_net_qty(0, fractional=frac)
+                    zc = _fmt_net_qty(0, fractional=frac)
+                    if note:
+                        print(f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc}{note}")
+                    elif not np.isfinite(px) or px <= 0:
+                        print(
+                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                            f"| skipped (invalid price for sizing)"
+                        )
+                    elif not frac:
+                        print(
+                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                            f"| skipped whole-share floor (${leg_usd:.2f} alloc < 1 share @ ${px:.2f})"
+                        )
+                    else:
+                        print(
+                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                            f"| skipped (target rounds to 0 shares)"
+                        )
                 continue
 
-            dq_clamped, short_note = _apply_live_short_constraints(trading_client, t, desired)
+            dq_clamped, short_note = _apply_live_short_constraints(
+                trading_client, t, desired, fractional=frac
+            )
+            cd = _fmt_net_qty(dq_clamped, fractional=frac)
+            cc = _fmt_net_qty(cur, fractional=frac)
             print(
-                f"  {t}: w={w:+.4f} px={px:.4f} desired_net={dq_clamped:+d} current={cur:+d}{short_note}{note}"
+                f"  {t}: w={w:+.4f} px={px:.4f} desired_net={cd} current={cc}{short_note}{note}"
             )
             if dq_clamped != desired and short_note:
-                desired = dq_clamped
+                desired = float(dq_clamped) if frac else int(dq_clamped)
 
-            if desired != cur:
+            ref_px = (
+                px
+                if np.isfinite(px) and px > 0 and (ext_hrs or frac)
+                else None
+            )
+            need_rec = (
+                abs(float(desired) - float(cur)) >= 1e-8
+                if frac
+                else int(round(desired)) != int(cur)
+            )
+            if need_rec:
                 _reconcile_symbol_net_qty(
                     trading_client,
                     t,
                     desired,
                     extended_hours=ext_hrs,
-                    reference_price=px if ext_hrs else None,
+                    reference_price=ref_px,
                     paper=paper,
+                    fractional=frac,
                 )
 
     if proxy_sym:
@@ -486,29 +555,48 @@ def _run_cycle(
         if use_bil_sleeve:
             bil_usd = float(sleeve_notional)
             if bil_usd < float(min_order_usd):
-                bil_desired = 0
+                bil_desired = 0.0
                 bil_note = f" | skipped sleeve ${bil_usd:.2f} < min_order"
             else:
-                bil_desired = _desired_shares_signed(1.0, bil_usd, bil_px)
+                bil_desired = _desired_qty_signed(1.0, bil_usd, bil_px, fractional=frac)
                 bil_note = ""
         else:
-            bil_desired = 0
+            bil_desired = 0.0
             bil_note = ""
-        bil_cur = int(round(_get_current_qty(trading_client, proxy_sym)))
-        if bil_desired != bil_cur or bil_note:
+        bil_cur_f = float(_get_current_qty(trading_client, proxy_sym))
+        bil_cur = _round_alpaca_qty(bil_cur_f) if frac else int(round(bil_cur_f))
+        bil_need_print = bool(bil_note) or (
+            abs(float(bil_desired) - float(bil_cur)) >= 1e-8
+            if frac
+            else int(round(bil_desired)) != int(bil_cur)
+        )
+        if bil_need_print:
             px_disp = f"{bil_px:.4f}" if np.isfinite(bil_px) and bil_px > 0 else "market"
+            bd = _fmt_net_qty(bil_desired, fractional=frac)
+            bc = _fmt_net_qty(bil_cur, fractional=frac)
             print(
                 f"  {proxy_sym}: sleeve={'risk-off full gross' if use_bil_sleeve else 'flat'} "
-                f"quote={px_disp} desired_net={bil_desired:+d} current={bil_cur:+d}{bil_note}"
+                f"quote={px_disp} desired_net={bd} current={bc}{bil_note}"
             )
-        if bil_desired != bil_cur:
+        bil_ref = (
+            bil_px
+            if np.isfinite(bil_px) and bil_px > 0 and (ext_hrs or frac)
+            else None
+        )
+        bil_need_rec = (
+            abs(float(bil_desired) - float(bil_cur)) >= 1e-8
+            if frac
+            else int(round(bil_desired)) != int(bil_cur)
+        )
+        if bil_need_rec:
             _reconcile_symbol_net_qty(
                 trading_client,
                 proxy_sym,
                 bil_desired,
                 extended_hours=ext_hrs,
-                reference_price=bil_px if ext_hrs and np.isfinite(bil_px) and bil_px > 0 else None,
+                reference_price=bil_ref,
                 paper=paper,
+                fractional=frac,
             )
 
 
@@ -522,14 +610,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    paper = bool(getattr(config, "MAD_LIVE_PAPER", getattr(config, "LIVE_BOT_PAPER", True)))
+    paper = config.bot_mode_is_paper()
     poll = max(int(getattr(config, "MAD_LIVE_POLL_SECONDS", 300)), 30)
     trade_open = bool(getattr(config, "MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN", True))
     min_order = float(getattr(config, "MAD_LIVE_MIN_ORDER_USD", 1.0))
 
     sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
     regime_disp = _display_regime_ticker(reg_ma, reg_tick)
-    mode = "PAPER" if paper else "LIVE"
+    _bm = str(getattr(config, "BOT_MODE", "paper")).strip().lower()
+    mode = "PAPER" if _bm == "paper" else "CASH"
     panel_syms = mad_universe_tickers()
     pipe_mode = str(getattr(config, "OHLCV_PIPELINE_MODE", "mad_universe")).strip()
     fetch_syms = tuple(config.ohlcv_pipeline_tickers())
@@ -547,6 +636,7 @@ def main() -> None:
         f"  optim DB        : {_mad_optim_db_path()} (load={getattr(config, 'MAD_LIVE_LOAD_PARAMS_FROM_DB', True)})\n"
         f"  RTH-only cycles : {trade_open} (False + extended_hours orders → after-hours testing)\n"
         f"  extended_hours  : {getattr(config, 'MAD_LIVE_EXTENDED_HOURS_ORDERS', False)}\n"
+        f"  fractional      : {getattr(config, 'MAD_LIVE_FRACTIONAL_SHARES', True)}\n"
         f"  regime sleeve   : {getattr(config, 'MAD_LIVE_REGIME_OFF_PROXY_TICKER', None) or 'cash'}\n"
         f"  poll_seconds    : {poll}\n"
         f"  dry_run         : {args.dry_run}\n"
