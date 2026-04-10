@@ -14,10 +14,19 @@ Parameters default to the ``summary`` table in ``{MAD_DATA_DIR}/{ref}_{gran}_mad
 ``MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY`` can flatten the whole account into that sleeve using
 ``MAD_LIVE_REGIME_OFF_EQUITY_FRACTION`` of equity. The sleeve is treated as cash-like: no OHLCV DB or
 splitter work; order sizing uses an Alpaca **market quote** only.
-For after-hours tests: set ``MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False`` and
-``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``. Extended-hours **limit** prices default to a live
-**ask/bid** anchor (see ``MAD_LIVE_EXT_HRS_LIMIT_FROM_DAILY_CLOSE``); printed ``px=`` is still MRAT's
-daily close for sizing context.
+
+**Rebalance schedule:** in the default long-running mode (no ``--once``), the bot does **not** trade on
+every poll; it runs **one** reconcile per **NYSE session day**, **after** that day’s official session
+close from Alpaca’s calendar (normally 4:00 p.m. US/Eastern; early closes use the calendar close).
+``MAD_LIVE_POLL_SECONDS`` is only how often it wakes to check the clock. Use ``--once`` for an
+immediate single cycle (e.g. cron a few minutes after the bell).
+
+Printed log timestamps and ``as_of`` lines use **US/Eastern** (``America/New_York``); internal
+throttles (e.g. splitter once per UTC day) remain UTC-based where noted.
+
+For after-hours tests: set ``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``. Extended-hours **limit** prices
+default to a live **ask/bid** anchor (see ``MAD_LIVE_EXT_HRS_LIMIT_FROM_DAILY_CLOSE``); printed ``px=``
+is still MRAT's daily close for sizing context.
 
 With ``MAD_LIVE_APPEND_DAILY_OHLCV`` (default True), each non-dry-run cycle **starts** by appending new
 ``1d`` bars from Alpaca into ``data/ohlcv/*.db`` and refreshing ``sma_21``/``sma_200`` (regime ETF:
@@ -38,11 +47,13 @@ import sqlite3
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetCalendarRequest
 
 from deepvibe_hedge import config
 from deepvibe_hedge.alpaca_asset import _alpaca_trading_keys
@@ -56,7 +67,6 @@ from deepvibe_hedge.alpaca_live import (
     _apply_live_short_constraints,
     _get_current_qty,
     _latest_stock_trade_price,
-    _market_is_open,
     _reconcile_symbol_net_qty,
     _round_alpaca_qty,
 )
@@ -66,6 +76,64 @@ from deepvibe_hedge.ohlcv_live_append import append_latest_daily_for_universe, s
 from deepvibe_hedge.paths import MAD_DATA_DIR, OHLCV_DIR
 
 _LAST_SPLITTER_REFRESH_UTC_DATE: date | None = None
+_LAST_EOD_REBALANCE_SESSION_DATE: date | None = None
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _fmt_now_et() -> str:
+    """Log line timestamp in US/Eastern (EST/EDT)."""
+    return datetime.now(_ET).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _snap_as_of_et_str(snap_as_of: object) -> str:
+    """Panel ``as_of`` (stored UTC) → US/Eastern display."""
+    t = pd.Timestamp(snap_as_of)
+    if t.tzinfo is None:
+        t = t.tz_localize(timezone.utc)
+    else:
+        t = t.tz_convert(timezone.utc)
+    return t.tz_convert(_ET).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _datetime_to_et(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_ET)
+
+
+def _trading_session_for_date(tc: TradingClient, d: date):
+    """Alpaca NYSE calendar row for ``d``, or ``None`` if no session (weekend/holiday)."""
+    try:
+        rows = tc.get_calendar(GetCalendarRequest(start=d, end=d))
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _eod_rebalance_should_run(tc: TradingClient) -> tuple[bool, str]:
+    """
+    True when (1) ``d`` is a trading session per Alpaca, (2) now is on or after session close in ET,
+    and (3) we have not already run for that session date.
+    """
+    global _LAST_EOD_REBALANCE_SESSION_DATE
+    now_et = datetime.now(_ET)
+    d = now_et.date()
+    sess = _trading_session_for_date(tc, d)
+    if sess is None:
+        return False, f"{d} — no exchange session (weekend/holiday)"
+    close_et = _datetime_to_et(sess.close)
+    if now_et < close_et:
+        return (
+            False,
+            f"before session close ({close_et.strftime('%Y-%m-%d %H:%M %Z')})",
+        )
+    sd = sess.date
+    if _LAST_EOD_REBALANCE_SESSION_DATE == sd:
+        return False, f"already rebalanced for session {sd}"
+    return True, f"EOD after close ({close_et.strftime('%H:%M %Z')})"
 
 
 def _ohlcv_health_reference_ticker() -> str:
@@ -180,7 +248,8 @@ def _maybe_refresh_splitter_dbs(*, force: bool = False) -> None:
         return
     syms = tuple(config.ohlcv_pipeline_tickers())
     print(
-        f"\n[MAD live] Splitter refresh: {len(syms)} symbol(s) → SMA columns + splits written to OHLCV DBs..."
+        f"\n[{_fmt_now_et()}] [MAD live] Splitter refresh: {len(syms)} symbol(s) → "
+        "SMA columns + splits written to OHLCV DBs..."
     )
     failed: list[tuple[str, str]] = []
     for sym in syms:
@@ -195,7 +264,10 @@ def _maybe_refresh_splitter_dbs(*, force: bool = False) -> None:
             print(f"  [splitter] FAILED {s}: {err}")
         if len(failed) > 15:
             print(f"  [splitter] ... +{len(failed) - 15} more failures")
-        print("  [splitter] UTC-day throttle not advanced — fix errors; will retry next poll.")
+        print(
+            "  [splitter] Throttle (UTC calendar day) not advanced — fix errors; "
+            "will retry next poll."
+        )
         return
     print(f"  [splitter] OK — updated {len(syms)} DB/CSV pair(s).")
     _LAST_SPLITTER_REFRESH_UTC_DATE = today
@@ -385,7 +457,7 @@ def _run_cycle(
         except Exception as exc:
             print(f"[ohlcv_append] ERROR: {exc}")
 
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    et_now = _fmt_now_et()
     sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
     snap = compute_mad_live_snapshot(
         short_w=sh,
@@ -421,8 +493,8 @@ def _run_cycle(
         sleeve_notional = float("nan")
 
     print(
-        f"\n[{utc_now}] MAD live cycle\n"
-        f"  as_of UTC date   : {snap.as_of.date()}\n"
+        f"\n[{et_now}] MAD live cycle\n"
+        f"  as_of (US/Eastern): {_snap_as_of_et_str(snap.as_of)}  (last panel bar)\n"
         f"  MRAT SMA         : {snap.mad_sma_short}/{snap.mad_sma_long} | exit MA={snap.mad_exit_ma or 'off'} | "
         f"{reg_line}\n"
         f"  regime risk-on   : {snap.regime_ok}\n"
@@ -601,8 +673,14 @@ def _run_cycle(
 
 
 def main() -> None:
+    global _LAST_EOD_REBALANCE_SESSION_DATE
+
     parser = argparse.ArgumentParser(description="MAD / MRAT Alpaca live bot")
-    parser.add_argument("--once", action="store_true", help="Single cycle then exit.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one reconcile cycle immediately, then exit (ignores EOD clock; use for cron).",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -612,7 +690,6 @@ def main() -> None:
 
     paper = config.bot_mode_is_paper()
     poll = max(int(getattr(config, "MAD_LIVE_POLL_SECONDS", 300)), 30)
-    trade_open = bool(getattr(config, "MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN", True))
     min_order = float(getattr(config, "MAD_LIVE_MIN_ORDER_USD", 1.0))
 
     sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
@@ -634,11 +711,12 @@ def main() -> None:
         f"  OHLCV pipeline  : {pipe_mode!r} → {len(fetch_syms)} fetch symbol(s) (``alpaca_fetcher``)\n"
         f"  params          : MRAT {sh}/{lo} exit_MA={ex} regime_MA={reg_ma} ticker={regime_disp!r}\n"
         f"  optim DB        : {_mad_optim_db_path()} (load={getattr(config, 'MAD_LIVE_LOAD_PARAMS_FROM_DB', True)})\n"
-        f"  RTH-only cycles : {trade_open} (False + extended_hours orders → after-hours testing)\n"
+        f"  rebalance       : EOD once/session after Alpaca calendar close (US/Eastern); "
+        f"poll={poll}s is wake interval only\n"
+        f"  --once          : run one reconcile immediately (ignores EOD schedule)\n"
         f"  extended_hours  : {getattr(config, 'MAD_LIVE_EXTENDED_HOURS_ORDERS', False)}\n"
         f"  fractional      : {getattr(config, 'MAD_LIVE_FRACTIONAL_SHARES', True)}\n"
         f"  regime sleeve   : {getattr(config, 'MAD_LIVE_REGIME_OFF_PROXY_TICKER', None) or 'cash'}\n"
-        f"  poll_seconds    : {poll}\n"
         f"  dry_run         : {args.dry_run}\n"
     )
     if missing_panel:
@@ -668,17 +746,34 @@ def main() -> None:
             _maybe_refresh_splitter_dbs(force=False)
         first_loop = False
 
-        if trade_open and not _market_is_open(tc):
-            now_txt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-            print(f"[{now_txt}] Market closed. Waiting {poll}s...")
-        else:
+        now_txt = _fmt_now_et()
+        if args.once:
             try:
+                print(f"\n[{now_txt}] Single cycle (--once)")
                 _run_cycle(tc, dry_run=False, min_order_usd=min_order, paper=paper)
                 _maybe_refresh_splitter_dbs(force=False)
             except Exception as exc:
                 print(f"  ERROR: {exc}")
-        if args.once:
             break
+
+        run_eod, eod_reason = _eod_rebalance_should_run(tc)
+        if run_eod:
+            now_et = datetime.now(_ET)
+            sess = _trading_session_for_date(tc, now_et.date())
+            if sess is None:
+                print(f"[{now_txt}] EOD gate passed but no calendar row — skipping")
+            else:
+                sd = sess.date
+                try:
+                    print(f"\n[{now_txt}] EOD rebalance — {eod_reason}")
+                    _run_cycle(tc, dry_run=False, min_order_usd=min_order, paper=paper)
+                    _LAST_EOD_REBALANCE_SESSION_DATE = sd
+                    _maybe_refresh_splitter_dbs(force=False)
+                except Exception as exc:
+                    print(f"  ERROR: {exc}")
+        else:
+            print(f"[{now_txt}] Idle — {eod_reason}. Next check in {poll}s.")
+
         time.sleep(poll)
 
 

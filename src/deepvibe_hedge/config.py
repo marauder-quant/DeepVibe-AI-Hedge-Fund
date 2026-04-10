@@ -162,7 +162,8 @@ MAD_PERM_PORT = 8065
 MAD_PERM_OPTIM_SPLIT = "avg"
 MAD_PERM_IS_SPLITS = MAD_IS_SPLITS
 
-MAD_LIVE_POLL_SECONDS = 300
+MAD_LIVE_POLL_SECONDS = 300  # How often live_bot wakes to check for EOD rebalance time.
+# Unused by live_bot: reconcile runs once per session after Alpaca calendar close (US/Eastern).
 MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False
 MAD_LIVE_LOAD_PARAMS_FROM_DB = True
 

@@ -1,0 +1,292 @@
+/* DeepVibe MAD live dashboard — dark tech UI */
+
+:root {
+  --dv-bg: #06060a;
+  --dv-surface: #0f0f14;
+  --dv-surface2: #14141c;
+  --dv-elevated: #1a1a24;
+  --dv-border: #2a2a36;
+  --dv-border-subtle: #1f1f28;
+  --dv-text: #f4f4f5;
+  --dv-muted: #a1a1aa;
+  --dv-dim: #71717a;
+  --dv-accent: #2dd4bf;
+  --dv-accent-glow: rgba(45, 212, 191, 0.12);
+  --dv-violet: #a78bfa;
+  --dv-danger: #fb7185;
+  --dv-radius: 14px;
+  --dv-radius-sm: 10px;
+  --dv-font: "DM Sans", "Inter", system-ui, -apple-system, sans-serif;
+  --dv-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html {
+  background-color: var(--dv-bg);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(1200px 600px at 20% -10%, rgba(45, 212, 191, 0.08), transparent),
+    radial-gradient(900px 500px at 90% 0%, rgba(167, 139, 250, 0.06), transparent),
+    linear-gradient(180deg, #06060a 0%, #0a0a10 50%, #06060a 100%);
+  color: var(--dv-text);
+  font-family: var(--dv-font);
+  -webkit-font-smoothing: antialiased;
+}
+
+.dv-root {
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+  box-sizing: border-box;
+}
+
+.dv-header {
+  margin-bottom: 28px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--dv-border-subtle);
+}
+
+.dv-title {
+  margin: 0 0 8px 0;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  background: linear-gradient(135deg, #f4f4f5 0%, #e4e4e7 40%, #2dd4bf 160%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.dv-subtitle {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--dv-muted);
+  font-weight: 400;
+}
+
+.dv-subtitle.dv-error {
+  color: var(--dv-danger);
+}
+
+.dv-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 10px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  border: 1px solid var(--dv-border);
+  background: var(--dv-surface2);
+  color: var(--dv-accent);
+  vertical-align: middle;
+}
+
+.dv-section-title {
+  margin: 0 0 14px 0;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dv-dim);
+}
+
+.dv-card {
+  background: var(--dv-surface);
+  border: 1px solid var(--dv-border-subtle);
+  border-radius: var(--dv-radius);
+  padding: 20px 22px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 32px rgba(0, 0, 0, 0.35);
+}
+
+.dv-card--chart {
+  padding-bottom: 12px;
+}
+
+.dv-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.dv-col-main {
+  flex: 1 1 520px;
+  min-width: 0;
+}
+
+.dv-col-side {
+  flex: 0 1 380px;
+  min-width: 280px;
+}
+
+.dv-hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--dv-border), transparent);
+  margin: 28px 0;
+}
+
+.dv-radio label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  margin-right: 8px;
+  margin-bottom: 6px;
+  border-radius: var(--dv-radius-sm);
+  border: 1px solid var(--dv-border);
+  background: var(--dv-surface2);
+  color: var(--dv-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.dv-radio input[type="radio"] {
+  accent-color: var(--dv-accent);
+}
+
+.dv-radio label:has(input[type="radio"]:checked) {
+  background: var(--dv-accent-glow);
+  border-color: rgba(45, 212, 191, 0.45);
+  color: var(--dv-text);
+}
+
+.dv-dropdown .Select-control {
+  background-color: var(--dv-surface2) !important;
+  border-color: var(--dv-border) !important;
+  border-radius: var(--dv-radius-sm) !important;
+  min-height: 42px !important;
+}
+
+.dv-dropdown .Select-placeholder,
+.dv-dropdown .Select-value-label,
+.dv-dropdown .Select-input > input {
+  color: var(--dv-text) !important;
+}
+
+.dv-dropdown .Select-menu-outer {
+  background-color: var(--dv-elevated) !important;
+  border: 1px solid var(--dv-border) !important;
+  border-radius: var(--dv-radius-sm) !important;
+}
+
+.dv-dropdown .Select-option {
+  background-color: var(--dv-elevated) !important;
+  color: var(--dv-text) !important;
+}
+
+.dv-dropdown .Select-option.is-focused {
+  background-color: var(--dv-surface2) !important;
+}
+
+.dv-dropdown .Select-arrow-zone {
+  color: var(--dv-muted) !important;
+}
+
+.dv-label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dv-dim);
+  margin-bottom: 8px;
+}
+
+.dv-portfolio-table {
+  width: 100%;
+  max-width: 420px;
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: var(--dv-radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--dv-border);
+  font-size: 0.9rem;
+}
+
+.dv-portfolio-table th,
+.dv-portfolio-table td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--dv-border-subtle);
+}
+
+.dv-portfolio-table th {
+  background: var(--dv-surface2);
+  color: var(--dv-dim);
+  font-weight: 600;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dv-portfolio-table td:first-child {
+  color: var(--dv-muted);
+}
+
+.dv-portfolio-table td:last-child {
+  font-family: var(--dv-mono);
+  font-size: 0.88rem;
+  color: var(--dv-text);
+  font-weight: 500;
+}
+
+.dv-portfolio-table tr:last-child th,
+.dv-portfolio-table tr:last-child td {
+  border-bottom: none;
+}
+
+.dv-mrat-summary {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: var(--dv-radius-sm);
+  background: var(--dv-surface2);
+  border: 1px solid var(--dv-border-subtle);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--dv-muted);
+}
+
+.dv-mrat-summary.dv-error {
+  color: var(--dv-danger);
+  border-color: rgba(251, 113, 133, 0.25);
+}
+
+.dv-placeholder {
+  color: var(--dv-dim);
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+
+.dv-graph-wrap {
+  border-radius: var(--dv-radius-sm);
+  overflow: hidden;
+  background: var(--dv-bg);
+  border: 1px solid var(--dv-border-subtle);
+}
+
+/* Plotly toolbar */
+.js-plotly-plot .plotly .modebar {
+  background: transparent !important;
+}
+
+.js-plotly-plot .plotly .modebar-btn path {
+  fill: var(--dv-muted) !important;
+}
+
+.js-plotly-plot .plotly .modebar-btn:hover path {
+  fill: var(--dv-accent) !important;
+}
+
+/* Dash Dropdown — id anchor for react-select shell */
+#chart-symbol .Select-control {
+  border-radius: var(--dv-radius-sm);
+}

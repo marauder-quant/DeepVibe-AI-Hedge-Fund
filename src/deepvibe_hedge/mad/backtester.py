@@ -37,6 +37,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -501,42 +502,7 @@ def _regime_risk_on_from_db_precomputed(
     return bool(c > s)
 
 
-def _regime_risk_on_for_next_session(
-    regime_ma_period: int,
-    regime_ticker: str | None,
-    granularity: str,
-    aggregate_to_daily: bool,
-    ohlcv_dir: Path,
-    *,
-    prefer_precomputed_sma: bool = False,
-) -> bool:
-    """
-    After the last regime close in SQLite, is the next session risk-on?
-
-    Aligns with ``portfolio_path_from_panel``: for calendar day *t*, regime gates weights using
-    ``close[t-1] > SMA[t-1]`` on the regime ETF. After the final close *D* in the DB, the next session
-    uses ``close[D] > SMA[D]`` (same bar included in SMA).
-    """
-    if int(regime_ma_period or 0) <= 0:
-        return True
-    sym = (regime_ticker or "").strip().upper() or (mad_regime_ticker_symbol() or "QQQ")
-    w = int(regime_ma_period)
-    gran_lc = str(granularity).strip().lower()
-    if prefer_precomputed_sma and gran_lc == "1d":
-        pc = _regime_risk_on_from_db_precomputed(sym, granularity, ohlcv_dir, w)
-        if pc is not None:
-            return pc
-    close = _load_regime_daily_close(sym, granularity, ohlcv_dir, aggregate_to_daily=aggregate_to_daily)
-    close = close.sort_index()
-    if len(close) < w:
-        return False
-    sma = _sma(close, w)
-    c = float(close.iloc[-1])
-    s = float(sma.iloc[-1])
-    return bool(np.isfinite(c) and np.isfinite(s) and c > s)
-
-
-def compute_mad_live_snapshot(
+def _build_mad_live_mrat_panel(
     *,
     short_w: int,
     long_w: int,
@@ -545,17 +511,12 @@ def compute_mad_live_snapshot(
     regime_ticker: str | None = None,
     ohlcv_dir: Path | None = None,
     direction_mode: str | None = None,
-) -> MadLiveSnapshot:
+) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame, bool, pd.Series]:
     """
-    Build equal-weight targets from local OHLCV DBs (same pipeline as the MAD backtester).
+    Shared OHLCV → MRAT panel for live bot and dashboard.
 
-    Uses the **last** panel date's ``signal`` (not ``entry_signal``): that is the book to hold for the
-    session after that close, consistent with ``entry_signal`` shifting by one bar in the backtest.
-
-    When ``config.MAD_LIVE_USE_PRECOMPUTED_SMA`` is True, loads ``sma_<short>``, ``sma_<long>``, and
-    optional ``sma_<exit>`` from each symbol DB (run ``data_splitter`` after fetch). MRAT then matches
-    the splitter-rounded SMAs. Missing columns fall back to rolling ``close``. Regime precomputed path
-    applies only for ``TARGET_CANDLE_GRANULARITY`` ``1d``.
+    Returns ``panel`` (all dates), ``last_date`` (UTC), ``sub`` (last-day rows per ticker),
+    ``regime_ok``, and ``sig_series`` aligned to ``mad_universe_tickers()``.
     """
     odir = ohlcv_dir or OHLCV_DIR
     ref = mad_reference_ticker()
@@ -619,6 +580,103 @@ def compute_mad_live_snapshot(
         odir,
         prefer_precomputed_sma=use_pc,
     )
+    return panel, last_date, sub, regime_ok, sig_series
+
+
+def mad_live_watchlist_reason(
+    row: pd.Series | None,
+    *,
+    regime_ok: bool,
+    direction_mode: str,
+    exit_ma_period: int,
+) -> str:
+    """Human-readable why a name is in/out of the book (last panel row)."""
+    dm = _normalize_direction_mode(direction_mode)
+    if not regime_ok:
+        return "Regime risk-off (flat targets)"
+    if row is None or row.empty:
+        return "Missing OHLCV / not in panel"
+    mrat = float(row.get("mrat", float("nan")))
+    if not np.isfinite(mrat):
+        return "MRAT unavailable (history, min price, or MA)"
+
+    sig = int(row.get("signal", 0) or 0)
+    if sig == 1:
+        return "Long (in MRAT book)"
+    if sig == -1:
+        return "Short (in MRAT book)"
+
+    d = float(row.get("decile", float("nan")))
+    sma_cs = float(row.get("sigma", float("nan")))
+    c = float(row.get("close", float("nan")))
+    ld_min = int(getattr(config, "MAD_LONG_DECILE_MIN", 10))
+    lsm = float(getattr(config, "MAD_LONG_SIGMA_MULT", 1.0))
+    sd_max = int(getattr(config, "MAD_SHORT_DECILE_MAX", 1))
+    ssm = float(getattr(config, "MAD_SHORT_SIGMA_MULT", 1.0))
+    if bool(getattr(config, "MAD_SYMMETRIC_SHORT_SIGMA", False)):
+        ssm = lsm
+
+    if not np.isfinite(sma_cs) or not np.isfinite(d):
+        return "Thin cross-section (σ or decile missing)"
+
+    gate_long = 1.0 + lsm * sma_cs
+    gate_short = 1.0 - ssm * sma_cs
+    ex_n = int(exit_ma_period or 0)
+    exv = row.get("mad_exit_ma_level")
+    exf = float(exv) if exv is not None and np.isfinite(exv) else float("nan")
+
+    if dm in ("long_only", "both") and ex_n > 0:
+        if (
+            d >= ld_min
+            and mrat > gate_long
+            and np.isfinite(exf)
+            and np.isfinite(c)
+            and c <= exf
+        ):
+            return f"Exit MA (close ≤ {ex_n}d SMA)"
+    if dm in ("short_only", "both") and ex_n > 0:
+        if (
+            d <= sd_max
+            and mrat < gate_short
+            and np.isfinite(exf)
+            and np.isfinite(c)
+            and c >= exf
+        ):
+            return f"Exit MA (close ≥ {ex_n}d SMA)"
+
+    parts: list[str] = []
+    if dm in ("long_only", "both"):
+        if d < ld_min:
+            parts.append(f"decile {d:.0f}% < {ld_min}")
+        elif mrat <= gate_long:
+            parts.append(f"MRAT {mrat:.3f} ≤ 1+kσ ({gate_long:.3f})")
+        else:
+            parts.append("long leg not elected")
+    if dm in ("short_only", "both"):
+        if d > sd_max:
+            parts.append(f"decile {d:.0f}% > {sd_max}")
+        elif mrat >= gate_short:
+            parts.append(f"MRAT {mrat:.3f} ≥ 1−kσ ({gate_short:.3f})")
+        else:
+            parts.append("short leg not elected")
+    if parts:
+        return "; ".join(parts)
+    return "Flat"
+
+
+def _mad_live_pack_snapshot(
+    panel: pd.DataFrame,
+    last_date: pd.Timestamp,
+    sub: pd.DataFrame,
+    regime_ok: bool,
+    sig_series: pd.Series,
+    *,
+    short_w: int,
+    long_w: int,
+    exit_ma_period: int,
+    regime_ma_period: int,
+) -> MadLiveSnapshot:
+    universe = mad_universe_tickers()
     if regime_ok:
         w = _weights_from_entries(sig_series)
     else:
@@ -649,6 +707,166 @@ def compute_mad_live_snapshot(
         mad_regime_ma=int(regime_ma_period or 0),
         n_long=n_long,
         n_short=n_short,
+    )
+
+
+def compute_mad_live_panel_and_snapshot(
+    *,
+    short_w: int,
+    long_w: int,
+    exit_ma_period: int,
+    regime_ma_period: int,
+    regime_ticker: str | None = None,
+    ohlcv_dir: Path | None = None,
+    direction_mode: str | None = None,
+) -> tuple[pd.DataFrame, MadLiveSnapshot, pd.DataFrame]:
+    """Full MRAT panel, live snapshot, and last-day panel rows (one DB pass)."""
+    panel, last_date, sub, regime_ok, sig_series = _build_mad_live_mrat_panel(
+        short_w=short_w,
+        long_w=long_w,
+        exit_ma_period=exit_ma_period,
+        regime_ma_period=regime_ma_period,
+        regime_ticker=regime_ticker,
+        ohlcv_dir=ohlcv_dir,
+        direction_mode=direction_mode,
+    )
+    snap = _mad_live_pack_snapshot(
+        panel,
+        last_date,
+        sub,
+        regime_ok,
+        sig_series,
+        short_w=short_w,
+        long_w=long_w,
+        exit_ma_period=exit_ma_period,
+        regime_ma_period=regime_ma_period,
+    )
+    return panel, snap, sub
+
+
+def mad_live_watchlist_table(
+    sub: pd.DataFrame,
+    *,
+    regime_ok: bool,
+    weight_by_ticker: dict[str, float],
+    universe: tuple[str, ...],
+    direction_mode: str,
+    exit_ma_period: int,
+) -> list[dict[str, Any]]:
+    """Rows for Dash ``DataTable`` (sorted by target weight magnitude, then ticker)."""
+    idxed = sub.set_index("ticker")
+    rows: list[dict[str, Any]] = []
+    for t in universe:
+        w = float(weight_by_ticker.get(t, 0.0))
+        row: pd.Series | None
+        if t in idxed.index:
+            raw = idxed.loc[t]
+            row = raw.iloc[-1] if isinstance(raw, pd.DataFrame) else raw
+        else:
+            row = None
+        reason = mad_live_watchlist_reason(
+            row,
+            regime_ok=regime_ok,
+            direction_mode=direction_mode,
+            exit_ma_period=exit_ma_period,
+        )
+        sig = int(row["signal"]) if row is not None and np.isfinite(row.get("signal", np.nan)) else 0
+        mrat = float(row["mrat"]) if row is not None and np.isfinite(row.get("mrat", np.nan)) else float("nan")
+        dec = float(row["decile"]) if row is not None and np.isfinite(row.get("decile", np.nan)) else float("nan")
+        sig_cs = float(row["sigma"]) if row is not None and np.isfinite(row.get("sigma", np.nan)) else float("nan")
+        lsm = float(getattr(config, "MAD_LONG_SIGMA_MULT", 1.0))
+        gate = 1.0 + lsm * sig_cs if np.isfinite(sig_cs) else float("nan")
+        rows.append(
+            {
+                "ticker": t,
+                "weight_pct": round(w * 100.0, 4),
+                "signal": sig,
+                "decile": round(dec, 2) if np.isfinite(dec) else None,
+                "mrat": round(mrat, 4) if np.isfinite(mrat) else None,
+                "sigma": round(sig_cs, 4) if np.isfinite(sig_cs) else None,
+                "one_plus_k_sigma": round(gate, 4) if np.isfinite(gate) else None,
+                "reason": reason,
+            }
+        )
+    rows.sort(key=lambda r: (-abs(float(r["weight_pct"])), r["ticker"]))
+    return rows
+
+
+def _regime_risk_on_for_next_session(
+    regime_ma_period: int,
+    regime_ticker: str | None,
+    granularity: str,
+    aggregate_to_daily: bool,
+    ohlcv_dir: Path,
+    *,
+    prefer_precomputed_sma: bool = False,
+) -> bool:
+    """
+    After the last regime close in SQLite, is the next session risk-on?
+
+    Aligns with ``portfolio_path_from_panel``: for calendar day *t*, regime gates weights using
+    ``close[t-1] > SMA[t-1]`` on the regime ETF. After the final close *D* in the DB, the next session
+    uses ``close[D] > SMA[D]`` (same bar included in SMA).
+    """
+    if int(regime_ma_period or 0) <= 0:
+        return True
+    sym = (regime_ticker or "").strip().upper() or (mad_regime_ticker_symbol() or "QQQ")
+    w = int(regime_ma_period)
+    gran_lc = str(granularity).strip().lower()
+    if prefer_precomputed_sma and gran_lc == "1d":
+        pc = _regime_risk_on_from_db_precomputed(sym, granularity, ohlcv_dir, w)
+        if pc is not None:
+            return pc
+    close = _load_regime_daily_close(sym, granularity, ohlcv_dir, aggregate_to_daily=aggregate_to_daily)
+    close = close.sort_index()
+    if len(close) < w:
+        return False
+    sma = _sma(close, w)
+    c = float(close.iloc[-1])
+    s = float(sma.iloc[-1])
+    return bool(np.isfinite(c) and np.isfinite(s) and c > s)
+
+
+def compute_mad_live_snapshot(
+    *,
+    short_w: int,
+    long_w: int,
+    exit_ma_period: int,
+    regime_ma_period: int,
+    regime_ticker: str | None = None,
+    ohlcv_dir: Path | None = None,
+    direction_mode: str | None = None,
+) -> MadLiveSnapshot:
+    """
+    Build equal-weight targets from local OHLCV DBs (same pipeline as the MAD backtester).
+
+    Uses the **last** panel date's ``signal`` (not ``entry_signal``): that is the book to hold for the
+    session after that close, consistent with ``entry_signal`` shifting by one bar in the backtest.
+
+    When ``config.MAD_LIVE_USE_PRECOMPUTED_SMA`` is True, loads ``sma_<short>``, ``sma_<long>``, and
+    optional ``sma_<exit>`` from each symbol DB (run ``data_splitter`` after fetch). MRAT then matches
+    the splitter-rounded SMAs. Missing columns fall back to rolling ``close``. Regime precomputed path
+    applies only for ``TARGET_CANDLE_GRANULARITY`` ``1d``.
+    """
+    panel, last_date, sub, regime_ok, sig_series = _build_mad_live_mrat_panel(
+        short_w=short_w,
+        long_w=long_w,
+        exit_ma_period=exit_ma_period,
+        regime_ma_period=regime_ma_period,
+        regime_ticker=regime_ticker,
+        ohlcv_dir=ohlcv_dir,
+        direction_mode=direction_mode,
+    )
+    return _mad_live_pack_snapshot(
+        panel,
+        last_date,
+        sub,
+        regime_ok,
+        sig_series,
+        short_w=short_w,
+        long_w=long_w,
+        exit_ma_period=exit_ma_period,
+        regime_ma_period=regime_ma_period,
     )
 
 

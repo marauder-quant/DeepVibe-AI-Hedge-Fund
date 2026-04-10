@@ -245,9 +245,18 @@ def _reconcile_symbol_net_qty(
     paper: bool | None = None,
     fractional: bool = False,
 ) -> tuple[float | int, float | int, float | int]:
-    current_qty = _get_current_qty(trading_client, symbol)
     min_usd = float(getattr(config, "MAD_LIVE_MIN_ORDER_USD", 1.0))
 
+    if bool(getattr(config, "MAD_LIVE_CANCEL_OPEN_BEFORE_RECONCILE", True)):
+        n_cx = _cancel_open_orders_for_symbol(trading_client, symbol)
+        if n_cx:
+            sym = symbol.strip().upper()
+            print(
+                f"  [{sym}] cancelled {n_cx} open order(s) before reconcile "
+                "(re-read position below for delta)"
+            )
+
+    current_qty = _get_current_qty(trading_client, symbol)
     if fractional:
         cur = _round_alpaca_qty(float(current_qty))
         d_tgt = _round_alpaca_qty(float(desired_qty_net))
@@ -269,29 +278,15 @@ def _reconcile_symbol_net_qty(
         if (fractional and abs(float(submit_delta)) >= 1e-8) or (
             not fractional and int(submit_delta) != 0
         ):
-            if bool(getattr(config, "MAD_LIVE_CANCEL_OPEN_BEFORE_RECONCILE", True)):
-                n_cx = _cancel_open_orders_for_symbol(trading_client, symbol)
-                if n_cx:
-                    sym = symbol.strip().upper()
-                    if fractional:
-                        print(
-                            f"  [{sym}] cancelled {n_cx} open order(s) before reconcile "
-                            f"(filled_net={cur:+.6f} → target {d_tgt:+.6f}, delta {float(submit_delta):+.6f})"
-                        )
-                    else:
-                        print(
-                            f"  [{sym}] cancelled {n_cx} open order(s) before reconcile "
-                            f"(filled_net={int(cur):+d} → target {int(d_tgt):+d}, delta {int(submit_delta):+d})"
-                        )
-        _submit_delta_order(
-            trading_client,
-            symbol,
-            submit_delta,
-            extended_hours=extended_hours,
-            reference_price=reference_price,
-            paper=paper,
-            fractional=fractional,
-        )
+            _submit_delta_order(
+                trading_client,
+                symbol,
+                submit_delta,
+                extended_hours=extended_hours,
+                reference_price=reference_price,
+                paper=paper,
+                fractional=fractional,
+            )
     except APIError as exc:
         sd = float(submit_delta) if fractional else int(submit_delta)
         if (

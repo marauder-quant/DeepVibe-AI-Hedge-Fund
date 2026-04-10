@@ -23,3 +23,6 @@ dev = ["ruff>=0.1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"deepvibe_hedge.mad" = ["dash_assets/*.css"]
