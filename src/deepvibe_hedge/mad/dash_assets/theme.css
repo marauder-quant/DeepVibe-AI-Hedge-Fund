@@ -159,7 +159,9 @@ body {
   color: var(--dv-text);
 }
 
-.dv-dropdown .Select-control {
+/* react-select v1 (legacy) */
+.dv-dropdown .Select-control,
+#chart-symbol .Select-control {
   background-color: var(--dv-surface2) !important;
   border-color: var(--dv-border) !important;
   border-radius: var(--dv-radius-sm) !important;
@@ -168,27 +170,68 @@ body {
 
 .dv-dropdown .Select-placeholder,
 .dv-dropdown .Select-value-label,
-.dv-dropdown .Select-input > input {
+.dv-dropdown .Select-input > input,
+#chart-symbol .Select-placeholder,
+#chart-symbol .Select-value-label,
+#chart-symbol .Select-input > input {
   color: var(--dv-text) !important;
 }
 
-.dv-dropdown .Select-menu-outer {
+.dv-dropdown .Select-menu-outer,
+#chart-symbol .Select-menu-outer {
   background-color: var(--dv-elevated) !important;
   border: 1px solid var(--dv-border) !important;
   border-radius: var(--dv-radius-sm) !important;
 }
 
-.dv-dropdown .Select-option {
+.dv-dropdown .Select-option,
+#chart-symbol .Select-option {
   background-color: var(--dv-elevated) !important;
   color: var(--dv-text) !important;
 }
 
-.dv-dropdown .Select-option.is-focused {
+.dv-dropdown .Select-option.is-focused,
+#chart-symbol .Select-option.is-focused {
   background-color: var(--dv-surface2) !important;
 }
 
-.dv-dropdown .Select-arrow-zone {
+.dv-dropdown .Select-arrow-zone,
+#chart-symbol .Select-arrow-zone {
   color: var(--dv-muted) !important;
+}
+
+/* Dash 3+ / React 18 dropdown (emotion / css modules) */
+#chart-symbol [role="combobox"],
+#chart-symbol div[class*="control"],
+#chart-symbol div[class*="Control"] {
+  background-color: var(--dv-surface2) !important;
+  border: 1px solid var(--dv-border) !important;
+  border-radius: var(--dv-radius-sm) !important;
+  min-height: 42px !important;
+  color: var(--dv-text) !important;
+}
+
+#chart-symbol input,
+#chart-symbol [class*="placeholder"],
+#chart-symbol [class*="singleValue"] {
+  color: var(--dv-text) !important;
+}
+
+#chart-symbol [role="listbox"],
+#chart-symbol [class*="menu"] {
+  background-color: var(--dv-elevated) !important;
+  border: 1px solid var(--dv-border) !important;
+  color: var(--dv-text) !important;
+}
+
+#chart-symbol [role="option"] {
+  background-color: var(--dv-elevated) !important;
+  color: var(--dv-text) !important;
+}
+
+#chart-symbol [role="option"]:hover,
+#chart-symbol [role="option"][aria-selected="true"] {
+  background-color: var(--dv-surface2) !important;
 }
 
 .dv-label {
@@ -237,6 +280,34 @@ body {
   font-size: 0.88rem;
   color: var(--dv-text);
   font-weight: 500;
+}
+
+.dv-performance-table {
+  max-width: 100%;
+  margin-top: 4px;
+}
+
+.dv-performance-table th,
+.dv-performance-table td {
+  text-align: right;
+  font-size: 0.82rem;
+}
+
+.dv-performance-table th:first-child,
+.dv-performance-table td:first-child {
+  text-align: left;
+}
+
+/* Candle + MRAT chart loading spinner (dark) */
+.dv-candle-loading-parent .dash-spinner,
+.dv-candle-loading .dash-spinner {
+  border-color: rgba(45, 212, 191, 0.25) !important;
+  border-top-color: var(--dv-accent) !important;
+}
+
+.dv-candle-loading-parent ._dash-loading-callback,
+.dv-candle-loading ._dash-loading-callback {
+  color: var(--dv-muted) !important;
 }
 
 .dv-portfolio-table tr:last-child th,

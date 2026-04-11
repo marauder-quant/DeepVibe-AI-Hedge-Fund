@@ -14,54 +14,70 @@ This README is written for **new users** who are comfortable clicking and typing
 
 ---
 
-## What you will install and run
+## Table of contents
 
-| Step | What it is |
-|------|------------|
-| **Docker** (optional but recommended) | A “boxed” Linux environment so Python and libraries work the same on any computer. |
-| **Cursor** | A free editor (like VS Code) with a built-in terminal where you run commands. |
-| **Git** | Used once to **clone** (download) this repository. |
-| **Alpaca account** | Free signup for market data and paper trading API keys. |
+1. [Getting started: prerequisites](#getting-started-prerequisites)
+2. [GitHub: account, repository, and cloning](#github-account-repository-and-cloning)
+3. [Clone this project and open it locally](#clone-this-project-and-open-it-locally)
+4. [How to run the code](#how-to-run-the-code)
 
-After setup you will:
+---
 
-1. Download historical prices for the default **Nasdaq-100** universe (plus the regime ETF **QQQ** if enabled in config).
+## Getting started: prerequisites
+
+You will need a few free tools. None of this replaces reading the rest of the guide, but it is the checklist most people follow before the first successful run.
+
+### What you will have when you are done
+
+| Piece | Why it matters |
+|------|----------------|
+| **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** (recommended) or local Python | A reliable way to run the same Python version and libraries this repo expects. |
+| A **code editor** with a terminal | Open files, paste API keys, and run commands in one place. |
+| **[Git](https://git-scm.com/downloads)** | Download this repository from GitHub (**clone**). |
+| A **[GitHub](https://github.com)** account (optional but common) | Fork or star the repo, open issues, or contribute. |
+| An **[Alpaca](https://alpaca.markets/)** account | Market data and (paper) trading API keys used by the fetcher and live bot. |
+
+After you finish [How to run the code](#how-to-run-the-code) you will be able to:
+
+1. Download historical prices for the default **Nasdaq-100** universe (plus the regime ETF **QQQ** when enabled in config).
 2. Run the **backtest** and open a results dashboard in your browser (default port **8063**).
 3. Optionally run the **live bot** (paper trading recommended) and the **live dashboard** (default port **8066**).
 
----
+### Docker Desktop (recommended)
 
-## 1. Install Docker Desktop
+Docker runs a small **Linux environment** on your computer so you can use the exact same `python` and `pip` steps as everyone else, without fighting OS-specific Python installs.
 
-Docker lets you run a standard **Python** environment without installing Python directly on Windows or macOS.
+1. Open **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** and download it for **Windows** or **Mac** (pick Apple Silicon or Intel when asked).
+2. Run the installer and **restart** if the installer tells you to.
+3. Launch **Docker Desktop** and wait until it reports **running** (whale icon in the system tray on Windows or the menu bar on Mac).
 
-1. Open **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** in your browser.
-2. Download Docker Desktop for **Windows** or **Mac** (Apple Silicon or Intel as prompted).
-3. Run the installer and **restart** your computer if asked.
-4. Start **Docker Desktop** from your applications menu and wait until it says it is **running** (whale icon in the system tray or menu bar).
+**Windows note:** Docker may ask you to enable **WSL 2**. That is normal; follow the prompts in the Docker installer or see [Microsoft’s WSL install guide](https://learn.microsoft.com/en-us/windows/wsl/install).
 
-**Linux:** Install Docker Engine using your distribution’s instructions ([Docker Engine on Linux](https://docs.docker.com/engine/install/)).
+**Linux:** You usually install **[Docker Engine](https://docs.docker.com/engine/install/)** instead of Docker Desktop (same idea for this project).
 
-**Note:** This repository does not ship a custom Docker image. You will use the official **Python** image and install this project inside it (steps below). That is normal.
+**Important:** This repository does **not** ship a custom image. You will start an official **`python:3.12-bookworm`** container and install the project inside it ([How to run the code](#how-to-run-the-code)). That is intentional and keeps the README simple.
 
----
+### Code editor and terminal
 
-## 2. Install Cursor
+**Recommended: [Cursor](https://cursor.com)** — a desktop editor built like VS Code, with a built-in AI assistant and a **terminal** where you run `git`, `docker`, and `python`. Download, install, then use **File → Open Folder** to open the cloned project.
 
-1. Open **[cursor.com](https://cursor.com)** and download **Cursor** for your system.
-2. Install it like any other application.
-3. Launch Cursor. You can sign in or skip if you prefer.
+**Alternatives** (any of these work if you prefer them):
 
-You will use Cursor to **open the project folder** and run commands in its **terminal** (menu: **Terminal → New Terminal**, or the shortcut shown in the app).
+- **[Visual Studio Code](https://code.visualstudio.com/)** — the widely used free editor Cursor is based on. Install the **Python** extension if prompted. You can add **[GitHub Copilot](https://github.com/features/copilot)** or other assistants separately.
+- **[Windsurf](https://windsurf.com/)** and other **VS Code–compatible** editors — same idea: open the project folder and use the integrated terminal.
+- **[VSCodium](https://vscodium.com/)** — an open-source build of VS Code without Microsoft branding (optional).
 
----
+Whatever you pick, you need a **terminal inside the project folder** for the commands in [How to run the code](#how-to-run-the-code). In Cursor and VS Code that is usually **Terminal → New Terminal** (or the shortcut shown in the app).
 
-## 3. Install Git (if you do not have it)
+### Git on your computer
 
-- **Windows:** Install from **[git-scm.com](https://git-scm.com/download/win)** (default options are fine).
-- **Mac:** Install **Xcode Command Line Tools** (`xcode-select --install` in Terminal) or use the Git installer from git-scm.com.
+**Git** is the command-line tool that talks to GitHub and **clones** (downloads) repositories.
 
-Check that Git works: open a terminal and run:
+- **Windows:** Install from **[git-scm.com/download/win](https://git-scm.com/download/win)** (default options are fine).
+- **Mac:** Run `xcode-select --install` in **Terminal** for Apple’s command-line tools, or install Git from **[git-scm.com](https://git-scm.com/downloads)**.
+- **Linux:** Install `git` with your package manager (for example `sudo apt install git` on Debian/Ubuntu).
+
+Check that it works:
 
 ```bash
 git --version
@@ -71,28 +87,61 @@ You should see a version number.
 
 ---
 
-## 4. Clone this repository
+## GitHub: account, repository, and cloning
 
-1. In Cursor, use **File → Open Folder** and pick an empty parent folder where you want the project (for example `Documents\Projects` on Windows or `~/Projects` on Mac).
-2. Open the **terminal** in Cursor (**Terminal → New Terminal**).
-3. Clone the repo (replace the URL with **your** fork or the URL your team gave you):
+**[GitHub](https://github.com)** hosts this project as a **repository** (“repo”): a folder with code and history. You **browse** it in the browser; you **clone** it to your machine to run it.
+
+### Create an account (if you do not have one)
+
+1. Go to **[github.com/signup](https://github.com/signup)** and create a free account.
+2. Verify your email if GitHub asks you to.
+
+You can **clone** public repositories without an account, but having an account lets you **fork** (your own copy), star repos, and open issues.
+
+### Fork vs clone (short version)
+
+- **Clone** — copies the repo **to your computer** so you can run code. You will do this in the next section.
+- **Fork** — creates **your copy of the repo on GitHub** (useful if you plan to change code and open pull requests). After forking, clone **your** fork’s URL instead of the original.
+
+### Where to copy the clone URL
+
+1. Open the repository page on GitHub (for example `https://github.com/OWNER/REPO_NAME`).
+2. Click the green **Code** button.
+3. Under **HTTPS**, copy the URL (it looks like `https://github.com/OWNER/REPO_NAME.git`).
+
+Official GitHub help: **[Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository)**.
+
+---
+
+## Clone this project and open it locally
+
+1. **Pick a parent folder** on your disk where projects live (for example `Documents\Projects` on Windows or `~/Projects` on Mac). You do **not** need to create the repo folder yourself; `git clone` will create it.
+2. Open your editor (**Cursor**, **VS Code**, or similar) and open a terminal (**Terminal → New Terminal**).
+3. In the terminal, `cd` to that parent folder, then clone (paste **your** URL from GitHub’s green **Code** button):
 
 ```bash
+cd ~/Projects
 git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
 cd YOUR_REPO_NAME
 ```
 
-If your folder name contains spaces (for example `DeepVibe AI Hedge Fund`), keep the quotes when you `cd`:
+If the folder name contains spaces (for example `DeepVibe AI Hedge Fund`), quote the path when you `cd`:
 
 ```bash
-cd "DeepVibe AI Hedge Fund"
+cd "/path/to/DeepVibe AI Hedge Fund"
 ```
+
+4. **Open the project in your editor:** **File → Open Folder** and select the **repository root** (the folder that contains `README.md` and `pyproject.toml`). From now on, every command in this README assumes the terminal’s current directory is that root.
 
 ---
 
-## 5. Run a Python environment (choose one)
+## How to run the code
 
-### Option A — Docker (recommended for beginners)
+The steps below pick up after the repository is open on your machine. Complete them **in order**.
+
+### 1. Run a Python environment (choose one)
+
+#### Option A — Docker (recommended for beginners)
 
 From your **project root** (the folder that contains `README.md` and `pyproject.toml`), run:
 
@@ -110,9 +159,9 @@ docker run -it --rm -v "${PWD}:/workspace" -w /workspace python:3.12-bookworm ba
 
 You should see a Linux prompt. **Stay inside this container** for all `pip` and `python` commands until you type `exit`.
 
-### Option B — Python on your computer
+#### Option B — Python on your computer
 
-1. Install **Python 3.10 or newer** from **[python.org](https://www.python.org/downloads/)** (check “Add Python to PATH” on Windows).
+1. Install **Python 3.10 or newer** from **[python.org/downloads](https://www.python.org/downloads/)** (on Windows, enable **Add Python to PATH** if the installer offers it).
 2. In the project folder, create a virtual environment and activate it:
 
 **Mac / Linux:**
@@ -131,7 +180,7 @@ python -m venv .venv
 
 ---
 
-## 6. Install project dependencies
+### 2. Install project dependencies
 
 In the **same** terminal (Docker shell or activated venv), from the **project root**:
 
@@ -144,7 +193,7 @@ Wait until it finishes without errors.
 
 ---
 
-## 7. Tell Python where the code lives (`PYTHONPATH`)
+### 3. Tell Python where the code lives (PYTHONPATH)
 
 This project keeps its package under `src/`. Every time you open a **new** terminal, set:
 
@@ -169,7 +218,7 @@ export PYTHONPATH=src
 
 ---
 
-## 8. Alpaca API keys and safety (paper trading)
+### 4. Alpaca API keys and safety (paper trading)
 
 1. Create a free account at **[Alpaca](https://alpaca.markets/)** and open the **dashboard** for API keys.
 2. Copy **Paper Trading** keys first (recommended for learning).
@@ -191,7 +240,7 @@ BOT_MODE = "paper"
 
 ---
 
-## 9. Default universe: Nasdaq-100
+### 5. Default universe: Nasdaq-100
 
 You do **not** need to edit anything for your **first** run. In `config.py`, **`MAD_UNIVERSE_TICKERS`** is set to **`nasdaq100`**, and the pipeline mode loads that full list (plus the **QQQ** regime ticker when regime logic is enabled).
 
@@ -199,11 +248,11 @@ The first **download** can take a long time (many symbols and years of daily dat
 
 ---
 
-## 10. First-time data pipeline (required before backtest)
+### 6. First-time data pipeline (required before backtest)
 
-Run **10a** and **10b** **in order** from the project root, with `PYTHONPATH` set as in section 7. Step **10c** is optional.
+Run **6a** and **6b** **in order** from the project root, with `PYTHONPATH` set as in [step 3](#3-tell-python-where-the-code-lives-pythonpath). Step **6c** is optional.
 
-### 10a. Download daily prices (Alpaca → SQLite)
+#### 6a. Download daily prices (Alpaca to SQLite)
 
 ```bash
 python -m deepvibe_hedge.alpaca_fetcher
@@ -211,7 +260,7 @@ python -m deepvibe_hedge.alpaca_fetcher
 
 This creates files under **`data/ohlcv/`** (that folder is not stored in Git).
 
-### 10b. Walk-forward splits and moving averages
+#### 6b. Walk-forward splits and moving averages
 
 ```bash
 python -m deepvibe_hedge.data_splitter
@@ -219,7 +268,7 @@ python -m deepvibe_hedge.data_splitter
 
 This updates the same databases with split labels and SMA columns used by the backtester and live stack.
 
-### 10c. (Optional) Inspect data
+#### 6c. (Optional) Inspect data
 
 ```bash
 python -m deepvibe_hedge.db_utils
@@ -227,7 +276,7 @@ python -m deepvibe_hedge.db_utils
 
 ---
 
-## 11. Run the default backtest (Nasdaq-100 panel)
+### 7. Run the default backtest (Nasdaq-100 panel)
 
 ```bash
 python -m deepvibe_hedge.mad.backtester
@@ -252,9 +301,35 @@ Output databases and tables are written under **`data/mad/`** (paths depend on r
 
 ---
 
-## 12. Live bot (Alpaca execution)
+### 8. Live bot (Alpaca execution)
 
-**Only after** steps 10a–10b have succeeded and you are on **paper** keys unless you fully understand live risk:
+**Only after** steps [6a](#6a-download-daily-prices-alpaca-to-sqlite)–[6b](#6b-walk-forward-splits-and-moving-averages) have succeeded and you are on **paper** keys unless you fully understand live risk:
+
+#### First time (or starting mid-day)
+
+The long-running bot **waits until after the official NYSE close** for its automatic rebalance. If you turn it on earlier in the day (for example **2:00 p.m. US/Eastern**), it will **not** place that day’s strategy trades until after the bell.
+
+To **open or align positions right away** before you leave the bot running:
+
+1. Run the **one-shot** helper (same as ``live_bot`` with ``--once``):
+
+```bash
+python -m deepvibe_hedge.mad.one_time_portfolio_rebalance
+```
+
+2. Then start the **long-running** bot so it can handle **future** session closes:
+
+```bash
+python -m deepvibe_hedge.mad.live_bot
+```
+
+Optional: ``--dry-run`` works on the helper too (targets only, no orders):
+
+```bash
+python -m deepvibe_hedge.mad.one_time_portfolio_rebalance --dry-run
+```
+
+#### Commands (reference)
 
 ```bash
 # See targets only — no orders
@@ -269,9 +344,11 @@ python -m deepvibe_hedge.mad.live_bot
 
 Printed times use **US/Eastern**. The bot can **append** new daily bars to your SQLite files before each cycle when configured (see `config.py` and the module docstring in `live_bot.py`).
 
+**Post-close window:** **`MAD_LIVE_REBALANCE_WINDOW_MINUTES`** (default **90**) is how many minutes **after Alpaca’s official session close** the bot is allowed to run that day’s **single** automated rebalance. Keeps your **one** batch of per-symbol orders in the **early** after-hours period (extended-hours limits still apply), instead of firing late at night if the process only wakes then. Set to **0** for legacy behavior (any time after close). Use **`--once`** for a manual rebalance outside the window.
+
 ---
 
-## 13. Live dashboard (equity, MRAT chart, watchlist)
+### 9. Live dashboard (equity, MRAT chart, watchlist)
 
 In a **second** terminal (same `PYTHONPATH=src`, same project root):
 
@@ -287,19 +364,19 @@ The first MRAT panel build can take **several minutes** while it reads many SQLi
 
 ---
 
-## 14. If something goes wrong
+### 10. If something goes wrong
 
 | Symptom | What to check |
 |--------|----------------|
-| `ModuleNotFoundError` | `PYTHONPATH=src` (or PowerShell `$env:PYTHONPATH="src"`) in **this** terminal session. |
+| `ModuleNotFoundError` | `PYTHONPATH=src` (or PowerShell `$env:PYTHONPATH="src"`) in **this** terminal session ([step 3](#3-tell-python-where-the-code-lives-pythonpath)). |
 | Alpaca errors | `.env` keys, **paper vs live** keys matching `BOT_MODE` in `config.py`. |
-| Backtest says not enough tickers | You need enough symbols with OHLCV databases; run the **fetcher** for the full universe (section 10a). |
-| Docker volume empty on Windows | Use **PowerShell** and `${PWD}` as in section 5, and ensure Docker Desktop file sharing includes your drive. |
+| Backtest says not enough tickers | You need enough symbols with OHLCV databases; run the **fetcher** for the full universe ([step 6a](#6a-download-daily-prices-alpaca-to-sqlite)). |
+| Docker volume empty on Windows | Use **PowerShell** and `${PWD}` as in [step 1](#1-run-a-python-environment-choose-one), and ensure Docker Desktop file sharing includes your drive. |
 | Port already in use | Change **`MAD_DASHBOARD_PORT`** in `config.py` (backtest) or edit **`DASHBOARD_PORT`** in `mad/live_dashboard.py` (live UI). |
 
 ---
 
-## 15. Technical reference (for developers)
+### 11. Technical reference (for developers)
 
 | Path | Role |
 |------|------|
@@ -310,6 +387,7 @@ The first MRAT panel build can take **several minutes** while it reads many SQLi
 | `src/deepvibe_hedge/db_utils.py` | CLI to inspect OHLCV SQLite files |
 | `src/deepvibe_hedge/mad/backtester.py` | Panel backtest, optimiser SQLite under `data/mad/` |
 | `src/deepvibe_hedge/mad/live_bot.py` | Alpaca paper/live execution |
+| `src/deepvibe_hedge/mad/one_time_portfolio_rebalance.py` | Wrapper: immediate reconcile (``live_bot --once``) |
 | `src/deepvibe_hedge/mad/live_dashboard.py` | Dash live UI (dark theme in `mad/dash_assets/theme.css`) |
 | `src/deepvibe_hedge/paths.py` | `DATA_ROOT`, `OHLCV_DIR`, `MAD_DATA_DIR` |
 

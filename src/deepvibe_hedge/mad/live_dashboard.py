@@ -3,8 +3,8 @@ Live Dash UI: equity (Alpaca), MRAT candle + watchlist (local SQLite panel), por
 User-visible times use **US/Eastern** (``America/New_York``, EST/EDT). APIs stay UTC internally.
 Dark theme: ``mad/dash_assets/theme.css`` (loaded via ``Dash(assets_folder=...)``).
 
-Defaults (no extra config keys): port 8066, MRAT refresh 20s, equity chart refresh 60s,
-~6k daily bars on chart (long history), 250 closed orders.
+Defaults (no extra config keys): port 8066, MRAT + equity chart refresh 20s,
+equity curve ranges: 24h (rolling, fixed x-axis), 1W / 1M / 1Y / YTD (US/Eastern), 250 closed orders.
 
 Run::
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -49,7 +50,6 @@ from deepvibe_hedge.mad.live_bot import load_mad_live_strategy_params
 # Defaults (intentionally not in config.py)
 DASHBOARD_PORT = 8066
 REFRESH_MS = 20_000
-EQUITY_REFRESH_MS = 60_000
 # ~6_000 sessions ≈ 24y of trading days — matches long OHLCV DBs (``TARGET_START_DATE`` / fetcher).
 CANDLE_BARS = 6000
 ORDER_HISTORY_LIMIT = 250
@@ -147,26 +147,365 @@ def _bar_adjustment() -> Adjustment | None:
     return Adjustment.SPLIT
 
 
-def _portfolio_history_request(equity_range: str) -> GetPortfolioHistoryRequest:
-    er = str(equity_range).strip()
-    if er == "1D":
+def _portfolio_history_request_for_range(equity_range: str) -> GetPortfolioHistoryRequest:
+    """Alpaca portfolio history by dashboard range (API uses UTC; chart displays US/Eastern)."""
+    er = str(equity_range).strip().lower()
+    if er == "24h":
+        end = datetime.now(timezone.utc)
         return GetPortfolioHistoryRequest(
-            period="1D", timeframe="5Min", extended_hours=True
+            start=end - timedelta(hours=24),
+            end=end,
+            timeframe="5Min",
+            extended_hours=True,
         )
-    if er == "1W":
+    if er == "1w":
         return GetPortfolioHistoryRequest(period="1W", timeframe="1H")
-    if er == "1M":
+    if er == "1m":
         return GetPortfolioHistoryRequest(period="1M", timeframe="1D")
-    if er == "1Y":
+    if er == "1y":
         return GetPortfolioHistoryRequest(period="1A", timeframe="1D")
+    if er == "ytd":
+        end = datetime.now(timezone.utc)
+        start_ny = datetime.now(_NY).replace(
+            month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        start = start_ny.astimezone(timezone.utc)
+        return GetPortfolioHistoryRequest(
+            start=start,
+            end=end,
+            timeframe="1D",
+        )
+    end = datetime.now(timezone.utc)
     return GetPortfolioHistoryRequest(
+        start=end - timedelta(hours=24),
+        end=end,
+        timeframe="5Min",
+        extended_hours=True,
+    )
+
+
+def _parse_portfolio_history_raw(hist: Any) -> tuple[list[datetime], list[float]]:
+    if isinstance(hist, dict):
+        ts = list(hist.get("timestamp") or [])
+        eq = list(hist.get("equity") or [])
+    else:
+        ts = list(getattr(hist, "timestamp", None) or [])
+        eq = list(getattr(hist, "equity", None) or [])
+    if not ts or not eq or len(ts) != len(eq):
+        return [], []
+    x_utc = [_ts_from_portfolio_hist(t) for t in ts]
+    eq_f = [float(v) for v in eq]
+    return x_utc, eq_f
+
+
+def _trim_equity_from_first_trade(
+    x_utc: list[datetime], eq_f: list[float], *, min_equity_usd: float = 1.0
+) -> tuple[list[datetime], list[float]]:
+    """Drop leading flat / zero-equity points (chart + all-time stats start when account had value)."""
+    i0 = 0
+    for i, v in enumerate(eq_f):
+        if np.isfinite(v) and float(v) >= float(min_equity_usd):
+            i0 = i
+            break
+    return x_utc[i0:], eq_f[i0:]
+
+
+def _ny_calendar_date(dt: datetime) -> date:
+    """Calendar date in US/Eastern (matches how users read Alpaca daily bars)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_NY).date()
+
+
+def _bar_index_ny_day(ts: Any) -> date:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    return t.tz_convert(_NY).date()
+
+
+def _first_fill_ny_date(tc: TradingClient) -> date | None:
+    """Earliest US/Eastern calendar day with a non-zero fill (chronological first trade day)."""
+    try:
+        orders = tc.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=500,
+                direction=Sort.ASC,
+                nested=True,
+            )
+        )
+    except Exception:
+        return None
+    if not orders:
+        return None
+    best: date | None = None
+    for o in orders:
+        raw_fa = getattr(o, "filled_at", None)
+        if raw_fa is None:
+            continue
+        try:
+            fq = float(getattr(o, "filled_qty", 0) or 0)
+        except (TypeError, ValueError):
+            fq = 0.0
+        if fq <= 0:
+            continue
+        t = pd.Timestamp(raw_fa)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        d = t.tz_convert(_NY).date()
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def _trim_equity_from_first_fill_or_cash(
+    tc: TradingClient,
+    x_utc: list[datetime],
+    eq_f: list[float],
+    *,
+    min_equity_usd: float = 1.0,
+) -> tuple[list[datetime], list[float], date | None]:
+    """
+    Prefer first US/Eastern day with a filled order; else first day equity >= ``min_equity_usd``.
+    Returns ``(x_trim, eq_trim, fill_ny_date_or_none)``.
+    """
+    fill_ny = _first_fill_ny_date(tc)
+    if fill_ny is not None:
+        for i, (t, v) in enumerate(zip(x_utc, eq_f)):
+            if _ny_calendar_date(t) < fill_ny:
+                continue
+            if np.isfinite(v) and float(v) >= float(min_equity_usd):
+                return x_utc[i:], eq_f[i:], fill_ny
+        for i, (t, v) in enumerate(zip(x_utc, eq_f)):
+            if _ny_calendar_date(t) >= fill_ny and np.isfinite(v) and float(v) > 0:
+                return x_utc[i:], eq_f[i:], fill_ny
+    tx, eq = _trim_equity_from_first_trade(x_utc, eq_f, min_equity_usd=min_equity_usd)
+    return tx, eq, fill_ny
+
+
+def _portfolio_return_pct_ny(
+    x_utc: list[datetime],
+    eq_f: list[float],
+    start_ny_date: date,
+    end_equity: float,
+) -> float | None:
+    """Return % from first daily sample on/after ``start_ny_date`` (ET calendar) to ``end_equity``."""
+    start_eq: float | None = None
+    for t, e in zip(x_utc, eq_f):
+        if _ny_calendar_date(t) >= start_ny_date:
+            if np.isfinite(e) and float(e) > 0:
+                start_eq = float(e)
+                break
+    if start_eq is None or start_eq <= 0 or not np.isfinite(end_equity) or end_equity <= 0:
+        return None
+    return (float(end_equity) / start_eq - 1.0) * 100.0
+
+
+def _benchmark_total_return_pct_ny(
+    closes: pd.Series, start_ny_date: date, end_now_utc: datetime
+) -> float | None:
+    """Buy-and-hold % using first/last daily bar by **US/Eastern** session date."""
+    if closes is None or closes.empty:
+        return None
+    s = closes.sort_index()
+    end_ny_d = end_now_utc.astimezone(_NY).date()
+    first_i: int | None = None
+    last_i: int | None = None
+    for i, ts in enumerate(s.index):
+        bd = _bar_index_ny_day(ts)
+        if bd >= start_ny_date and first_i is None:
+            first_i = i
+        if bd <= end_ny_d:
+            last_i = i
+    if (
+        first_i is None
+        or last_i is None
+        or last_i < first_i
+        or not np.isfinite(float(s.iloc[first_i]))
+        or not np.isfinite(float(s.iloc[last_i]))
+    ):
+        return None
+    first = float(s.iloc[first_i])
+    last = float(s.iloc[last_i])
+    if first <= 0 or last <= 0:
+        return None
+    return (last / first - 1.0) * 100.0
+
+
+def _benchmark_daily_closes(
+    symbol: str, start: datetime, end: datetime
+) -> pd.Series:
+    """Daily close series indexed by UTC midnight (``Timestamp``)."""
+    sym = str(symbol).strip().upper()
+    paper = _paper_mode()
+    key, secret = _alpaca_trading_keys(paper=paper)
+    dc = StockHistoricalDataClient(api_key=key, secret_key=secret)
+    feeds: list[DataFeed] = []
+    for fd in (_data_feed(), DataFeed.IEX, DataFeed.SIP):
+        if fd not in feeds:
+            feeds.append(fd)
+    end_u = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    start_u = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    for fd in feeds:
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=sym,
+                timeframe=TimeFrame.Day,
+                start=start_u,
+                end=end_u,
+                adjustment=_bar_adjustment(),
+                feed=fd,
+            )
+            bars = dc.get_stock_bars(req)
+            if bars is None or sym not in bars.data or not bars.data[sym]:
+                continue
+            out: dict[pd.Timestamp, float] = {}
+            for b in bars.data[sym]:
+                if isinstance(b, dict):
+                    ts = pd.Timestamp(b["timestamp"])
+                    cl = float(b["close"])
+                else:
+                    ts = pd.Timestamp(b.timestamp)
+                    cl = float(b.close)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                out[ts.normalize()] = cl
+            if not out:
+                continue
+            return pd.Series(out).sort_index()
+        except (APIError, OSError, ValueError):
+            continue
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
+
+
+def _fmt_perf_pct(p: float | None) -> html.Td:
+    if p is None or not np.isfinite(p):
+        return html.Td("—", style={"color": UI["muted"]})
+    color = UI["up"] if p > 1e-9 else (UI["down"] if p < -1e-9 else UI["muted"])
+    return html.Td(
+        f"{p:+.2f}%",
+        style={"color": color, "fontFamily": UI["font"], "fontWeight": "600"},
+    )
+
+
+def _portfolio_performance_section(tc: TradingClient, acct: Any) -> html.Div:
+    """
+    Period returns vs DIA / SPY / QQQ (proxies for Dow, S&P 500, Nasdaq-100).
+    Uses Alpaca portfolio history + same-calendar ETF bars.
+    """
+    end_now = datetime.now(timezone.utc)
+    req = GetPortfolioHistoryRequest(
         timeframe="1D",
         start=datetime(2010, 1, 1, tzinfo=timezone.utc),
+        end=end_now,
+    )
+    try:
+        hist = tc.get_portfolio_history(req)
+        x_utc, eq_f = _parse_portfolio_history_raw(hist)
+    except Exception:
+        x_utc, eq_f = [], []
+    if not x_utc:
+        return html.Div(
+            html.P(
+                "Performance vs benchmarks: no portfolio history yet.",
+                className="dv-placeholder",
+                style={"marginTop": "12px"},
+            )
+        )
+    x_trim, eq_trim, fill_ny = _trim_equity_from_first_fill_or_cash(tc, x_utc, eq_f)
+    if not x_trim:
+        return html.Div(
+            html.P(
+                "Performance vs benchmarks: waiting for first equity above $1 in history.",
+                className="dv-placeholder",
+                style={"marginTop": "12px"},
+            )
+        )
+    end_eq = float(acct.equity)
+    end_ny = end_now.astimezone(_NY)
+    ytd_ny_date = date(end_ny.year, 1, 1)
+    m6_ny_date = (end_ny - timedelta(days=183)).date()
+    m3_ny_date = (end_ny - timedelta(days=92)).date()
+    all_ny_date = fill_ny if fill_ny is not None else _ny_calendar_date(x_trim[0])
+    if fill_ny is not None:
+        all_label = f"All-time (since first fill · {fill_ny.isoformat()} ET)"
+    else:
+        all_label = "All-time (since first activity)"
+
+    min_bench = min(all_ny_date, ytd_ny_date, m6_ny_date, m3_ny_date)
+    bench_start = datetime.combine(min_bench, datetime.min.time(), tzinfo=_NY) - timedelta(
+        days=14
+    )
+    bench_start = bench_start.astimezone(timezone.utc)
+
+    dia = _benchmark_daily_closes("DIA", bench_start, end_now)
+    spy = _benchmark_daily_closes("SPY", bench_start, end_now)
+    qqq = _benchmark_daily_closes("QQQ", bench_start, end_now)
+
+    periods: list[tuple[str, date]] = [
+        (all_label, all_ny_date),
+        ("Year to date", ytd_ny_date),
+        ("Last 6 months", m6_ny_date),
+        ("Last 3 months", m3_ny_date),
+    ]
+
+    rows = [
+        html.Tr(
+            [
+                html.Th("Period"),
+                html.Th("Portfolio"),
+                html.Th("Dow (DIA)"),
+                html.Th("S&P 500 (SPY)"),
+                html.Th("Nasdaq-100 (QQQ)"),
+            ]
+        )
+    ]
+    for label, ny_d in periods:
+        pr = _portfolio_return_pct_ny(x_trim, eq_trim, ny_d, end_eq)
+        br_d = _benchmark_total_return_pct_ny(dia, ny_d, end_now)
+        br_s = _benchmark_total_return_pct_ny(spy, ny_d, end_now)
+        br_q = _benchmark_total_return_pct_ny(qqq, ny_d, end_now)
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(label, style={"color": UI["muted"]}),
+                    _fmt_perf_pct(pr),
+                    _fmt_perf_pct(br_d),
+                    _fmt_perf_pct(br_s),
+                    _fmt_perf_pct(br_q),
+                ]
+            )
+        )
+
+    return html.Div(
+        [
+            html.P(
+                "Total return vs ETF proxies (same US/Eastern calendar window; not risk-adjusted). "
+                "All-time starts on the first fill day when available; otherwise first equity slice. "
+                "Portfolio uses Alpaca daily equity; benchmarks use adjusted daily closes.",
+                style={
+                    "fontSize": "0.78rem",
+                    "color": UI["muted"],
+                    "margin": "14px 0 8px 0",
+                    "lineHeight": "1.45",
+                },
+            ),
+            html.Table(rows, className="dv-portfolio-table dv-performance-table"),
+        ]
     )
 
 
 def _apply_equity_chart_axes(fig: go.Figure, *, title: str | None = None) -> None:
-    """Dark theme + vertical spike on hover."""
+    """Dark theme + vertical spike/crosshair following the cursor (US/Eastern x-axis)."""
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=UI["paper"],
@@ -177,7 +516,9 @@ def _apply_equity_chart_axes(fig: go.Figure, *, title: str | None = None) -> Non
         xaxis_title="Time (US/Eastern)",
         yaxis_title="USD",
         showlegend=False,
-        hovermode="x",
+        hovermode="x unified",
+        hoverdistance=-1,
+        spikedistance=-1,
         hoverlabel=dict(
             bgcolor=UI["elevated"],
             font=dict(color=UI["text"], family=UI["font"]),
@@ -192,7 +533,7 @@ def _apply_equity_chart_axes(fig: go.Figure, *, title: str | None = None) -> Non
         showspikes=True,
         spikecolor=UI["accent"],
         spikesnap="cursor",
-        spikemode="across",
+        spikemode="across+marker",
         spikethickness=1,
         gridcolor=UI["grid"],
         zerolinecolor=UI["grid"],
@@ -273,10 +614,129 @@ def _parse_equity_hover_ts(xv: Any) -> str:
         return str(xv)
 
 
+def _stitch_live_equity_end(
+    x_utc: list[datetime],
+    eq_f: list[float],
+    now_ny: datetime,
+    live_equity: float | None,
+    *,
+    merge_within_sec: float,
+) -> None:
+    """Append or refresh the last sample to **now** with live account equity (mutates lists)."""
+    if live_equity is None or not np.isfinite(live_equity):
+        return
+    now_utc = now_ny.astimezone(timezone.utc)
+    lv = float(live_equity)
+    if not x_utc:
+        x_utc.append(now_utc)
+        eq_f.append(lv)
+        return
+    last_ny = x_utc[-1].astimezone(_NY)
+    if (now_ny - last_ny).total_seconds() <= merge_within_sec:
+        x_utc[-1] = now_utc
+        eq_f[-1] = lv
+    else:
+        x_utc.append(now_utc)
+        eq_f.append(lv)
+
+
+def _equity_line_and_probe_traces(
+    x_plot: list[datetime],
+    eq_f: list[float],
+    *,
+    b0: float,
+    pct_caption: str,
+    n_probe: int = 400,
+) -> list[Any]:
+    """
+    Visible line without hover plus a transparent dense scatter so the cursor always
+    picks up a point (stable tooltip + crosshair along the full x domain).
+    """
+    if not x_plot or not eq_f or len(x_plot) != len(eq_f):
+        return []
+    if len(x_plot) == 1:
+        v0 = float(eq_f[0])
+        pct = (
+            f"{(v0 / b0 - 1.0) * 100.0:+.2f}%"
+            if b0 > 0 and np.isfinite(v0)
+            else "—"
+        )
+        return [
+            go.Scatter(
+                x=x_plot,
+                y=eq_f,
+                mode="markers",
+                marker=dict(size=12, color=UI["accent"]),
+                name="Equity",
+                customdata=[[v0, pct]],
+                hovertemplate=(
+                    "<b>%{x|%Y-%m-%d %H:%M %Z}</b><br>"
+                    "Equity: <b>$%{customdata[0]:,.2f}</b><br>"
+                    f"{pct_caption}: <b>%{{customdata[1]}}</b><extra></extra>"
+                ),
+            )
+        ]
+    t_nums = np.array([t.timestamp() for t in x_plot], dtype=float)
+    y_pts = np.array(eq_f, dtype=float)
+    t0, t1 = float(t_nums[0]), float(t_nums[-1])
+    if t1 <= t0:
+        t1 = t0 + 1.0
+    grid = np.linspace(t0, t1, int(max(32, min(n_probe, 800))))
+    yi = np.interp(grid, t_nums, y_pts)
+    x_dense = [
+        datetime.fromtimestamp(float(g), tz=timezone.utc).astimezone(_NY) for g in grid
+    ]
+    pcts: list[str] = []
+    for v in yi:
+        if b0 > 0 and np.isfinite(v):
+            pcts.append(f"{(float(v) / b0 - 1.0) * 100.0:+.2f}%")
+        else:
+            pcts.append("—")
+    line = go.Scatter(
+        x=x_plot,
+        y=eq_f,
+        mode="lines",
+        line=dict(width=2.5, color=UI["accent"]),
+        name="Equity",
+        hoverinfo="skip",
+    )
+    cd_probe = [[float(v), p] for v, p in zip(yi, pcts)]
+    probe = go.Scatter(
+        x=x_dense,
+        y=list(yi),
+        mode="markers",
+        marker=dict(size=22, opacity=0, color="rgba(0,0,0,0)", line=dict(width=0)),
+        name="Equity",
+        showlegend=False,
+        customdata=cd_probe,
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M %Z}</b><br>"
+            "Equity: <b>$%{customdata[0]:,.2f}</b><br>"
+            f"{pct_caption}: <b>%{{customdata[1]}}</b><extra></extra>"
+        ),
+    )
+    return [line, probe]
+
+
 def _equity_figure_and_snapshot(
-    equity_range: str, tc: TradingClient
+    tc: TradingClient,
+    equity_range: str,
 ) -> tuple[go.Figure, dict[str, Any] | None]:
-    req = _portfolio_history_request(equity_range)
+    """
+    Equity vs time in **US/Eastern**. Ranges: rolling 24h (fixed x window), 1W, 1M, 1Y, YTD.
+    Last point uses live account equity at **now** where applicable.
+    """
+    er_l = str(equity_range or "24h").strip().lower()
+    now_ny = datetime.now(_NY)
+    window_start_24h = now_ny - timedelta(hours=24)
+
+    live_equity: float | None = None
+    try:
+        live_equity = float(tc.get_account().equity)
+    except Exception:
+        live_equity = None
+
+    req = _portfolio_history_request_for_range(er_l)
     hist = tc.get_portfolio_history(req)
     if isinstance(hist, dict):
         ts = list(hist.get("timestamp") or [])
@@ -284,48 +744,75 @@ def _equity_figure_and_snapshot(
     else:
         ts = list(getattr(hist, "timestamp", None) or [])
         eq = list(getattr(hist, "equity", None) or [])
-    if not ts or not eq or len(ts) != len(eq):
+
+    x_utc: list[datetime] = []
+    eq_f: list[float] = []
+    if ts and eq and len(ts) == len(eq):
+        x_utc = [_ts_from_portfolio_hist(t) for t in ts]
+        eq_f = [float(v) for v in eq]
+
+    if er_l == "24h":
+        xf: list[datetime] = []
+        ef: list[float] = []
+        for t, e in zip(x_utc, eq_f):
+            tn = t.astimezone(_NY)
+            if tn < window_start_24h or tn > now_ny:
+                continue
+            xf.append(t)
+            ef.append(e)
+        x_utc, eq_f = xf, ef
+        merge_sec = 360.0
+    elif er_l == "1w":
+        merge_sec = 4000.0
+    elif er_l in ("1m", "1y", "ytd"):
+        merge_sec = 86400.0
+    else:
+        merge_sec = 360.0
+
+    _stitch_live_equity_end(
+        x_utc, eq_f, now_ny, live_equity, merge_within_sec=merge_sec
+    )
+
+    titles_map = {
+        "24h": "Account equity (rolling 24h · US/Eastern)",
+        "1w": "Account equity (1 week · US/Eastern)",
+        "1m": "Account equity (1 month · US/Eastern)",
+        "1y": "Account equity (1 year · US/Eastern)",
+        "ytd": "Account equity (YTD · US/Eastern)",
+    }
+    title = titles_map.get(er_l, "Account equity · US/Eastern")
+
+    if not x_utc:
         fig = go.Figure()
-        _apply_equity_chart_axes(fig, title="Account equity (no data)")
+        _apply_equity_chart_axes(fig, title=f"{title} (no data)")
+        if er_l == "24h":
+            fig.update_xaxes(
+                range=[window_start_24h, now_ny], autorange=False, fixedrange=True
+            )
         return fig, None
 
-    x_utc = [_ts_from_portfolio_hist(t) for t in ts]
     x_plot = [t.astimezone(_NY) for t in x_utc]
-    eq_f = [float(v) for v in eq]
     b0 = float(eq_f[0])
-    pct_labels: list[str] = []
-    for v in eq_f:
-        vv = float(v)
-        if b0 > 0 and np.isfinite(vv):
-            pct_labels.append(f"{(vv / b0 - 1.0) * 100.0:+.2f}%")
-        else:
-            pct_labels.append("—")
-    fig = go.Figure(
-        data=[
-            go.Scatter(
-                x=x_plot,
-                y=eq_f,
-                mode="lines",
-                line=dict(width=2.5, color=UI["accent"]),
-                name="Equity",
-                customdata=pct_labels,
-                hovertemplate=(
-                    "<b>%{x|%Y-%m-%d %H:%M %Z}</b><br>"
-                    "Equity: <b>$%{y:,.2f}</b><br>"
-                    "vs range start: <b>%{customdata}</b>"
-                    "<extra></extra>"
-                ),
-            )
-        ]
+    pct_caption = "vs 24h window start" if er_l == "24h" else "vs range start"
+    traces = _equity_line_and_probe_traces(
+        x_plot, eq_f, b0=b0, pct_caption=pct_caption
     )
-    _apply_equity_chart_axes(fig, title="Account equity")
-    fig.update_layout(uirevision=f"equity-{equity_range}")
+    fig = go.Figure(data=traces)
+    _apply_equity_chart_axes(fig, title=title)
+    if er_l == "24h":
+        fig.update_xaxes(
+            range=[window_start_24h, now_ny], autorange=False, fixedrange=True
+        )
+    else:
+        fig.update_xaxes(autorange=True, fixedrange=False)
+
+    fig.update_layout(uirevision=f"equity-{er_l}")
     snap: dict[str, Any] = {
         "baseline_equity": b0,
         "baseline_ts_display": _fmt_instant_ny(x_utc[0]),
         "chart_last_equity": float(eq_f[-1]),
         "chart_ts_display": _fmt_instant_ny(x_utc[-1]),
-        "equity_range": str(equity_range),
+        "equity_range": er_l,
     }
     return fig, snap
 
@@ -977,27 +1464,33 @@ def build_app() -> Dash:
                     html.Div(
                         [
                             html.H4("Equity curve", className="dv-section-title"),
-                            dcc.Store(id="equity-latest-store", data=None),
-                            dcc.Store(id="live-account-store", data=None),
-                            html.Div(id="equity-tracker"),
+                            html.P(
+                                "Times are US/Eastern (EST/EDT). Hover anywhere on the chart for "
+                                "equity (interpolated along the line) and a vertical crosshair.",
+                                className="dv-subtitle",
+                                style={"marginBottom": "10px", "fontSize": "0.82rem"},
+                            ),
                             dcc.RadioItems(
                                 id="equity-range",
                                 options=[
-                                    {"label": " 1D ", "value": "1D"},
-                                    {"label": " 1W ", "value": "1W"},
-                                    {"label": " 1M ", "value": "1M"},
-                                    {"label": " 1Y ", "value": "1Y"},
-                                    {"label": " All ", "value": "all"},
+                                    {"label": " 24h ", "value": "24h"},
+                                    {"label": " 1W ", "value": "1w"},
+                                    {"label": " 1M ", "value": "1m"},
+                                    {"label": " 1Y ", "value": "1y"},
+                                    {"label": " YTD ", "value": "ytd"},
                                 ],
-                                value="1M",
+                                value="24h",
                                 inline=True,
                                 className="dv-radio",
                                 style={"marginBottom": "14px"},
                             ),
+                            dcc.Store(id="equity-latest-store", data=None),
+                            dcc.Store(id="live-account-store", data=None),
+                            html.Div(id="equity-tracker"),
                             html.Div(
                                 dcc.Graph(
                                     id="equity-graph",
-                                    clear_on_unhover=True,
+                                    clear_on_unhover=False,
                                     config=GRAPH_CONFIG,
                                 ),
                                 className="dv-graph-wrap",
@@ -1009,25 +1502,42 @@ def build_app() -> Dash:
                         [
                             html.Div(
                                 [
-                                    html.Label("Chart symbol", className="dv-label"),
-                                    dcc.Dropdown(
-                                        id="chart-symbol",
-                                        clearable=False,
-                                        value=ref_sym,
-                                        options=[{"label": ref_sym, "value": ref_sym}],
-                                        className="dv-dropdown",
-                                        style={
-                                            "color": UI["text"],
-                                            "backgroundColor": UI["surface2"],
-                                        },
-                                    ),
-                                    html.Div(
-                                        dcc.Graph(
-                                            id="candle-mrat-graph",
-                                            config=GRAPH_CONFIG,
-                                        ),
-                                        className="dv-graph-wrap",
-                                        style={"marginTop": "14px"},
+                                    dcc.Loading(
+                                        id="candle-mrat-loading",
+                                        type="circle",
+                                        color=UI["accent"],
+                                        className="dv-candle-loading",
+                                        style={"minHeight": "480px"},
+                                        parent_className="dv-candle-loading-parent",
+                                        children=[
+                                            html.Label(
+                                                "Chart symbol", className="dv-label"
+                                            ),
+                                            dcc.Dropdown(
+                                                id="chart-symbol",
+                                                clearable=False,
+                                                value=ref_sym,
+                                                options=[
+                                                    {
+                                                        "label": ref_sym,
+                                                        "value": ref_sym,
+                                                    }
+                                                ],
+                                                className="dv-dropdown",
+                                                style={
+                                                    "color": UI["text"],
+                                                    "backgroundColor": UI["surface2"],
+                                                },
+                                            ),
+                                            html.Div(
+                                                dcc.Graph(
+                                                    id="candle-mrat-graph",
+                                                    config=GRAPH_CONFIG,
+                                                ),
+                                                className="dv-graph-wrap",
+                                                style={"marginTop": "14px"},
+                                            ),
+                                        ],
                                     ),
                                 ],
                                 className="dv-col-main",
@@ -1163,12 +1673,6 @@ def build_app() -> Dash:
                         **_datatable_dark(),
                     ),
                     dcc.Interval(
-                        id="equity-interval",
-                        interval=EQUITY_REFRESH_MS,
-                        n_intervals=0,
-                        max_intervals=-1,
-                    ),
-                    dcc.Interval(
                         id="tick",
                         interval=REFRESH_MS,
                         n_intervals=0,
@@ -1183,18 +1687,18 @@ def build_app() -> Dash:
     @app.callback(
         Output("equity-graph", "figure"),
         Output("equity-latest-store", "data"),
-        Input("equity-interval", "n_intervals"),
+        Input("tick", "n_intervals"),
         Input("equity-range", "value"),
         prevent_initial_call=False,
     )
-    def _refresh_equity_chart(_n, equity_range):
-        """Alpaca portfolio history for the line chart (1-minute interval)."""
-        er = equity_range or "1M"
+    def _refresh_equity_chart(_tick_n, equity_range):
+        """Alpaca portfolio history: selected range, US/Eastern; 24h uses a fixed rolling window."""
         disconnected = _empty_equity_figure("Account equity (disconnected)")
         if _tc is None:
             return disconnected, None
+        er = equity_range or "24h"
         try:
-            eq_fig, snap = _equity_figure_and_snapshot(er, _tc)
+            eq_fig, snap = _equity_figure_and_snapshot(_tc, er)
             return eq_fig, snap
         except Exception as exc:
             return _empty_equity_figure(f"Account / orders error: {exc}"), None
@@ -1234,10 +1738,16 @@ def build_app() -> Dash:
                 className="dv-placeholder",
             )
         pct_t, pct_c = _pct_vs_baseline_label(live_eq, baseline)
+        er = str((latest or {}).get("equity_range") or "")
+        cap_tail = (
+            "vs 24h window start"
+            if er == "24h"
+            else "vs range start (first point on chart)"
+        )
         return _equity_tracker_block(
             _fmt_money(live_eq),
             ts_disp,
-            caption="Live account · US/Eastern (vs range start)",
+            caption=f"Live account · US/Eastern ({cap_tail})",
             pct_text=pct_t,
             pct_color=pct_c,
         )
@@ -1267,22 +1777,32 @@ def build_app() -> Dash:
                 "live_equity": float(acct.equity),
                 "as_of_display": datetime.now(_NY).strftime("%Y-%m-%d %H:%M %Z"),
             }
-            stats = html.Table(
+            stats = html.Div(
                 [
-                    html.Tr([html.Th("Field"), html.Th("Value")]),
-                    html.Tr([html.Td("Equity"), html.Td(_fmt_money(acct.equity))]),
-                    html.Tr([html.Td("Cash"), html.Td(_fmt_money(acct.cash))]),
-                    html.Tr(
-                        [html.Td("Buying power"), html.Td(_fmt_money(acct.buying_power))]
-                    ),
-                    html.Tr(
+                    html.Table(
                         [
-                            html.Td("Portfolio value"),
-                            html.Td(_fmt_money(getattr(acct, "portfolio_value", None))),
-                        ]
+                            html.Tr([html.Th("Field"), html.Th("Value")]),
+                            html.Tr([html.Td("Equity"), html.Td(_fmt_money(acct.equity))]),
+                            html.Tr([html.Td("Cash"), html.Td(_fmt_money(acct.cash))]),
+                            html.Tr(
+                                [
+                                    html.Td("Buying power"),
+                                    html.Td(_fmt_money(acct.buying_power)),
+                                ]
+                            ),
+                            html.Tr(
+                                [
+                                    html.Td("Portfolio value"),
+                                    html.Td(
+                                        _fmt_money(getattr(acct, "portfolio_value", None))
+                                    ),
+                                ]
+                            ),
+                        ],
+                        className="dv-portfolio-table",
                     ),
-                ],
-                className="dv-portfolio-table",
+                    _portfolio_performance_section(_tc, acct),
+                ]
             )
             pos = _positions_table(_tc)
             try:

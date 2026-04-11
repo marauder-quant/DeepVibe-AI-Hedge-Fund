@@ -163,6 +163,11 @@ MAD_PERM_OPTIM_SPLIT = "avg"
 MAD_PERM_IS_SPLITS = MAD_IS_SPLITS
 
 MAD_LIVE_POLL_SECONDS = 300  # How often live_bot wakes to check for EOD rebalance time.
+# After Alpaca session close, only submit orders if now is within this many minutes of ``close``
+# (US/Eastern). Stops a bot that starts hours later (e.g. 10 p.m.) from placing that session's
+# rebalance. Extended-hours limits still apply; this only gates *when* the cycle runs. ``0`` = off
+# (legacy: any time after close). Early closes use the calendar ``close`` time as the anchor.
+MAD_LIVE_REBALANCE_WINDOW_MINUTES = 90
 # Unused by live_bot: reconcile runs once per session after Alpaca calendar close (US/Eastern).
 MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False
 MAD_LIVE_LOAD_PARAMS_FROM_DB = True

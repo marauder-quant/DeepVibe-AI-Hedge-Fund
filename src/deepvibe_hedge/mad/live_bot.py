@@ -16,10 +16,12 @@ Parameters default to the ``summary`` table in ``{MAD_DATA_DIR}/{ref}_{gran}_mad
 splitter work; order sizing uses an Alpaca **market quote** only.
 
 **Rebalance schedule:** in the default long-running mode (no ``--once``), the bot does **not** trade on
-every poll; it runs **one** reconcile per **NYSE session day**, **after** that day’s official session
-close from Alpaca’s calendar (normally 4:00 p.m. US/Eastern; early closes use the calendar close).
-``MAD_LIVE_POLL_SECONDS`` is only how often it wakes to check the clock. Use ``--once`` for an
-immediate single cycle (e.g. cron a few minutes after the bell).
+every poll; it runs **one** reconcile per **NYSE session day**, **after** that day’s session close
+from Alpaca’s calendar, and only if ``MAD_LIVE_REBALANCE_WINDOW_MINUTES`` allows (default places orders
+in the first ~90 minutes after that close so a process started at 10 p.m. does not trade that session).
+``MAD_LIVE_POLL_SECONDS`` is how often it wakes to check the clock. Use ``--once`` for an immediate
+single cycle (e.g. cron right after the bell). Set ``MAD_LIVE_REBALANCE_WINDOW_MINUTES = 0`` to allow
+submission any time after close (legacy).
 
 Printed log timestamps and ``as_of`` lines use **US/Eastern** (``America/New_York``); internal
 throttles (e.g. splitter once per UTC day) remain UTC-based where noted.
@@ -45,7 +47,7 @@ import io
 import math
 import sqlite3
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,6 +55,7 @@ import numpy as np
 import pandas as pd
 import requests
 from alpaca.trading.client import TradingClient
+from alpaca.trading.models import Calendar
 from alpaca.trading.requests import GetCalendarRequest
 
 from deepvibe_hedge import config
@@ -96,35 +99,49 @@ def _snap_as_of_et_str(snap_as_of: object) -> str:
     return t.tz_convert(_ET).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def _datetime_to_et(dt: datetime) -> datetime:
+def _alpaca_calendar_open_close_to_et(dt: datetime) -> datetime:
+    """
+    Alpaca's ``Calendar`` model builds naive ``open``/``close`` from ``date`` + ``%H:%M`` strings —
+    NYSE **local** wall time, not UTC. Tagging naive as UTC shifts the bell by several hours.
+    """
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=_ET)
     return dt.astimezone(_ET)
 
 
-def _trading_session_for_date(tc: TradingClient, d: date):
-    """Alpaca NYSE calendar row for ``d``, or ``None`` if no session (weekend/holiday)."""
+def _trading_session_for_date(
+    tc: TradingClient, d: date
+) -> tuple[Calendar | None, str | None]:
+    """
+    Returns ``(row, None)`` when the calendar call succeeds.
+
+    ``(None, None)`` means no row (weekend/holiday). ``(None, err)`` means the API call failed
+    (transient); callers must not treat that as a holiday.
+    """
     try:
         rows = tc.get_calendar(GetCalendarRequest(start=d, end=d))
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
     if not rows:
-        return None
-    return rows[0]
+        return None, None
+    return rows[0], None
 
 
 def _eod_rebalance_should_run(tc: TradingClient) -> tuple[bool, str]:
     """
-    True when (1) ``d`` is a trading session per Alpaca, (2) now is on or after session close in ET,
-    and (3) we have not already run for that session date.
+    True when (1) today is a trading session, (2) now is on or after session close in ET,
+    (3) now is within ``MAD_LIVE_REBALANCE_WINDOW_MINUTES`` of that close (unless 0 = disabled),
+    and (4) this session date is not already handled (rebalanced or skipped past window).
     """
     global _LAST_EOD_REBALANCE_SESSION_DATE
     now_et = datetime.now(_ET)
     d = now_et.date()
-    sess = _trading_session_for_date(tc, d)
+    sess, cal_err = _trading_session_for_date(tc, d)
+    if cal_err is not None:
+        return False, f"calendar API error — {cal_err}"
     if sess is None:
         return False, f"{d} — no exchange session (weekend/holiday)"
-    close_et = _datetime_to_et(sess.close)
+    close_et = _alpaca_calendar_open_close_to_et(sess.close)
     if now_et < close_et:
         return (
             False,
@@ -132,8 +149,26 @@ def _eod_rebalance_should_run(tc: TradingClient) -> tuple[bool, str]:
         )
     sd = sess.date
     if _LAST_EOD_REBALANCE_SESSION_DATE == sd:
-        return False, f"already rebalanced for session {sd}"
-    return True, f"EOD after close ({close_et.strftime('%H:%M %Z')})"
+        return False, f"EOD already handled for session {sd}"
+
+    win_min = int(getattr(config, "MAD_LIVE_REBALANCE_WINDOW_MINUTES", 0) or 0)
+    win_end: datetime | None = None
+    if win_min > 0:
+        win_end = close_et + timedelta(minutes=win_min)
+        if now_et > win_end:
+            _LAST_EOD_REBALANCE_SESSION_DATE = sd
+            return (
+                False,
+                f"past post-close window (close+{win_min}m → {win_end.strftime('%H:%M %Z')}); "
+                f"skipped session {sd} — run with --once if you need a late manual rebalance",
+            )
+
+    win_note = (
+        f", window +{win_min}m to {win_end.strftime('%H:%M %Z')}"
+        if win_min > 0 and win_end is not None
+        else ""
+    )
+    return True, f"EOD after close ({close_et.strftime('%H:%M %Z')}{win_note})"
 
 
 def _ohlcv_health_reference_ticker() -> str:
@@ -527,6 +562,11 @@ def _run_cycle(
         return
 
     print(f"  gross notional USD : {gross:,.2f} (MRAT equity fraction + cap)")
+    print(
+        "  reconcile: one Alpaca order per symbol that still drifts vs target after "
+        "cancel/re-read (normal to see many small fractional fills in one EOD pass).",
+        flush=True,
+    )
     if use_bil_sleeve:
         print(
             f"  regime-off sleeve  : ${sleeve_notional:,.2f} "
@@ -759,8 +799,12 @@ def main() -> None:
         run_eod, eod_reason = _eod_rebalance_should_run(tc)
         if run_eod:
             now_et = datetime.now(_ET)
-            sess = _trading_session_for_date(tc, now_et.date())
-            if sess is None:
+            sess, cal_err = _trading_session_for_date(tc, now_et.date())
+            if cal_err is not None:
+                print(
+                    f"[{now_txt}] EOD gate passed but calendar re-fetch failed — {cal_err}"
+                )
+            elif sess is None:
                 print(f"[{now_txt}] EOD gate passed but no calendar row — skipping")
             else:
                 sd = sess.date
