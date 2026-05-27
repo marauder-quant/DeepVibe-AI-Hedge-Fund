@@ -37,6 +37,7 @@ With ``MAD_LIVE_APPEND_DAILY_OHLCV`` (default True), each non-dry-run cycle **st
 Usage:
     PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --dry-run
     PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --once
+    PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --rebalance-once   # same as --once
     PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot
 """
 from __future__ import annotations
@@ -62,9 +63,19 @@ from deepvibe_hedge import config
 from deepvibe_hedge.alpaca_asset import _alpaca_trading_keys
 from deepvibe_hedge.mad.backtester import (
     compute_mad_live_snapshot,
+    compute_mad_multi_index_live_snapshot,
     mad_reference_ticker,
     mad_regime_ticker_symbol,
     mad_universe_tickers,
+)
+from deepvibe_hedge.mad.regime_sleeve import (
+    describe_sleeve_config,
+    resolve_regime_tickers as _resolve_regime_tickers_cfg,
+    sleeve_and_regime_symbols,
+)
+from deepvibe_hedge.mad.index_allocator import (
+    format_index_allocation_banner,
+    index_allocator_enabled,
 )
 from deepvibe_hedge.alpaca_live import (
     _apply_live_short_constraints,
@@ -337,6 +348,21 @@ def _run_ohlcv_health_check(reg_ma: int, reg_tick: str | None) -> None:
         raise RuntimeError("MAD live: OHLCV health check failed — fix fetch/split or relax config.")
 
 
+def _format_sleeve_summary() -> str:
+    """Short one-liner describing ``MAD_REGIME_OFF_SLEEVE`` + safe harbor for the boot log."""
+    cfg = describe_sleeve_config(config)
+    sleeve: tuple = cfg["sleeve"]
+    harbor: str = cfg["safe_harbor"]
+    if not sleeve and not harbor:
+        return "cash"
+    parts: list[str] = []
+    for sym, w, tma in sleeve:
+        tail = f" (trend {tma}D)" if int(tma) > 0 else ""
+        parts.append(f"{sym} {float(w):.0%}{tail}")
+    parts.append(f"safe-harbor={harbor or '∅'}")
+    return " | ".join(parts)
+
+
 def _display_regime_ticker(reg_ma: int, reg_tick: str | None) -> str:
     if int(reg_ma or 0) <= 0:
         return "off"
@@ -430,20 +456,54 @@ def _desired_qty_signed(
     return float(int(math.copysign(int(math.floor(mag)), usd)))
 
 
-def _flatten_account_except_proxy(
+def _reconcile_one_symbol_or_continue(
+    trading_client: TradingClient,
+    symbol: str,
+    desired_qty_net: float | int,
+    *,
+    extended_hours: bool,
+    reference_price: float | None,
+    paper: bool,
+    fractional: bool,
+) -> None:
+    """Submit reconcile for one symbol; log and continue if Alpaca (or sizing) fails."""
+    sym = str(symbol).strip().upper()
+    try:
+        _reconcile_symbol_net_qty(
+            trading_client,
+            symbol,
+            desired_qty_net,
+            extended_hours=extended_hours,
+            reference_price=reference_price,
+            paper=paper,
+            fractional=fractional,
+        )
+    except Exception as exc:
+        print(
+            f"  [{sym}] reconcile failed — skipping this symbol, continuing batch: {exc}",
+            flush=True,
+        )
+
+
+def _flatten_account_except_sleeve(
     trading_client: TradingClient,
     *,
-    proxy_sym: str,
+    keep_symbols: set[str],
     close_by_ticker: dict[str, float],
     ext_hrs: bool,
     paper: bool,
     fractional: bool,
 ) -> None:
-    """Sell/cover every open position except the sleeve ETF (regime-off full pivot)."""
-    px = proxy_sym.strip().upper()
+    """Sell/cover every open position except the sleeve tickers (regime-off full pivot).
+
+    ``keep_symbols`` is the set of sleeve / safe-harbor tickers currently targeted by
+    the snapshot — those are reconciled separately so the account ends up holding
+    only the risk-off sleeve.
+    """
+    keep = {str(s).strip().upper() for s in keep_symbols if s}
     for pos in trading_client.get_all_positions():
         sym = str(pos.symbol).strip().upper()
-        if sym == px:
+        if sym in keep:
             continue
         cur_f = float(pos.qty)
         cur = round(cur_f, 6) if fractional else int(round(cur_f))
@@ -465,7 +525,7 @@ def _flatten_account_except_proxy(
         if (fractional and abs(float(desired) - float(cur)) >= 1e-8) or (
             not fractional and int(desired) != int(cur)
         ):
-            _reconcile_symbol_net_qty(
+            _reconcile_one_symbol_or_continue(
                 trading_client,
                 sym,
                 desired,
@@ -494,26 +554,56 @@ def _run_cycle(
 
     et_now = _fmt_now_et()
     sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
-    snap = compute_mad_live_snapshot(
-        short_w=sh,
-        long_w=lo,
-        exit_ma_period=ex,
-        regime_ma_period=reg_ma,
-        regime_ticker=reg_tick,
-    )
+    # Multi-index allocator: run the stock picker per enabled slot and blend
+    # by the allocator's per-ETF weight + risk-off share. Equity and sleeve
+    # share one flat ``weight_by_ticker`` (sleeve weights already scaled by
+    # ``risk_off_share``); the legacy sleeve-flatten branch is skipped below.
+    multi_index_on = index_allocator_enabled(config)
+    if multi_index_on:
+        snap = compute_mad_multi_index_live_snapshot(
+            short_w=sh,
+            long_w=lo,
+            exit_ma_period=ex,
+        )
+    else:
+        snap = compute_mad_live_snapshot(
+            short_w=sh,
+            long_w=lo,
+            exit_ma_period=ex,
+            regime_ma_period=reg_ma,
+            regime_ticker=reg_tick,
+        )
     rma = int(snap.mad_regime_ma or 0)
     reg_line = (
         "regime off"
         if rma <= 0
         else f"regime MA={rma} ETF={_display_regime_ticker(rma, reg_tick)!r}"
     )
-    proxy_raw = getattr(config, "MAD_LIVE_REGIME_OFF_PROXY_TICKER", None)
-    proxy_sym = str(proxy_raw).strip().upper() if proxy_raw else ""
-    use_bil_sleeve = bool(proxy_sym) and not snap.regime_ok
-    close_all_np = bool(
-        use_bil_sleeve
-        and getattr(config, "MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY", True)
-    )
+    # Multi-ticker sleeve: snapshot carries the full risk-off allocation (e.g. GLD/TLT/BIL)
+    # from ``mad.regime_sleeve``. Legacy single-ticker ``MAD_LIVE_REGIME_OFF_PROXY_TICKER``
+    # is still honored because ``regime_sleeve.resolve_sleeve`` falls back to it.
+    #
+    # Multi-index mode: sleeve weights are already merged into ``weight_by_ticker``
+    # (scaled by the allocator's ``risk_off_share``) so equity and sleeve size
+    # uniformly against one gross notional. Skip the legacy flatten-all-except-
+    # sleeve path entirely — that branch is only correct when the whole book is
+    # 100% risk-off, which the multi-index allocator handles implicitly via its
+    # per-slot trend gates (a slot's weight is 0 when its ETF fails trend).
+    if multi_index_on:
+        sleeve_targets = {}
+        sleeve_syms: set[str] = set()
+        use_sleeve = False
+        close_all_np = False
+    else:
+        sleeve_targets = (
+            dict(snap.sleeve_weight_by_ticker) if not snap.regime_ok else {}
+        )
+        sleeve_syms = {s for s in sleeve_targets if s}
+        use_sleeve = bool(sleeve_syms)
+        close_all_np = bool(
+            use_sleeve
+            and getattr(config, "MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY", True)
+        )
     ext_hrs = bool(getattr(config, "MAD_LIVE_EXTENDED_HOURS_ORDERS", False))
     frac = bool(getattr(config, "MAD_LIVE_FRACTIONAL_SHARES", True))
 
@@ -521,20 +611,26 @@ def _run_cycle(
         assert trading_client is not None
         gross = _gross_notional_usd(trading_client)
         sleeve_notional = (
-            _regime_off_sleeve_notional_usd(trading_client) if use_bil_sleeve else float("nan")
+            _regime_off_sleeve_notional_usd(trading_client) if use_sleeve else float("nan")
         )
     else:
         gross = float("nan")
         sleeve_notional = float("nan")
 
+    sleeve_desc = (
+        ", ".join(f"{k}:{v:.1%}" for k, v in sorted(sleeve_targets.items()))
+        if use_sleeve
+        else "MRAT book"
+    )
     print(
         f"\n[{et_now}] MAD live cycle\n"
         f"  as_of (US/Eastern): {_snap_as_of_et_str(snap.as_of)}  (last panel bar)\n"
         f"  MRAT SMA         : {snap.mad_sma_short}/{snap.mad_sma_long} | exit MA={snap.mad_exit_ma or 'off'} | "
         f"{reg_line}\n"
-        f"  regime risk-on   : {snap.regime_ok}\n"
+        f"  weighting scheme : {snap.weighting_scheme}\n"
+        f"  regime status    : {snap.regime_info or ('RISK-ON' if snap.regime_ok else 'RISK-OFF')}\n"
         f"  raw long / short : {snap.n_long} / {snap.n_short}\n"
-        f"  regime sleeve    : {proxy_sym or 'cash'} (active={'yes' if use_bil_sleeve else 'no — MRAT book'})\n"
+        f"  risk-off sleeve  : {sleeve_desc}\n"
         f"  extended_hours   : {ext_hrs}\n"
         f"  fractional_shares: {frac}\n"
     )
@@ -551,14 +647,15 @@ def _run_cycle(
                 dq = _desired_qty_signed(w, ex_gross, px, fractional=True)
                 qtxt = f"  qty≈{_fmt_net_qty(dq, fractional=True)}"
             print(f"    {t:6s} w={w:+.4f} close={px:.4f} leg≈${leg:,.0f}{qtxt}")
-        if proxy_sym:
+        if use_sleeve:
             re_frac = float(getattr(config, "MAD_LIVE_REGIME_OFF_EQUITY_FRACTION", 0.995))
-            ex_sleeve = ex_gross * re_frac if use_bil_sleeve else 0.0
-            print(
-                f"    {proxy_sym:6s} sleeve {'ON' if use_bil_sleeve else 'off'} "
-                f"@ ${ex_sleeve:,.0f} regime-off notional (no OHLCV; size with Alpaca quote when live) | "
-                f"close_all_non_proxy={close_all_np}"
-            )
+            sleeve_gross = ex_gross * re_frac
+            for sym, sw in sorted(sleeve_targets.items()):
+                leg = sleeve_gross * abs(sw)
+                print(
+                    f"    {sym:6s} sleeve w={sw:+.4f} @ ${leg:,.0f} "
+                    f"(close_all_non_proxy={close_all_np})"
+                )
         return
 
     print(f"  gross notional USD : {gross:,.2f} (MRAT equity fraction + cap)")
@@ -567,7 +664,7 @@ def _run_cycle(
         "cancel/re-read (normal to see many small fractional fills in one EOD pass).",
         flush=True,
     )
-    if use_bil_sleeve:
+    if use_sleeve:
         print(
             f"  regime-off sleeve  : ${sleeve_notional:,.2f} "
             f"({float(getattr(config, 'MAD_LIVE_REGIME_OFF_EQUITY_FRACTION', 0.995)):.4f} × equity) | "
@@ -576,11 +673,11 @@ def _run_cycle(
     else:
         print()
 
-    if use_bil_sleeve and close_all_np:
-        _flatten_account_except_proxy(
+    if use_sleeve and close_all_np:
+        _flatten_account_except_sleeve(
             trading_client,
-            proxy_sym=proxy_sym,
-            close_by_ticker=snap.close_by_ticker,
+            keep_symbols=sleeve_syms,
+            close_by_ticker={**snap.close_by_ticker, **snap.sleeve_close_by_ticker},
             ext_hrs=ext_hrs,
             paper=paper,
             fractional=frac,
@@ -588,7 +685,7 @@ def _run_cycle(
     else:
         for t in snap.tickers:
             w = snap.weight_by_ticker.get(t, 0.0)
-            if proxy_sym and t == proxy_sym and use_bil_sleeve:
+            if t in sleeve_syms and use_sleeve:
                 continue
             px = snap.close_by_ticker.get(t, float("nan"))
             leg_usd = abs(w) * gross
@@ -652,7 +749,7 @@ def _run_cycle(
                 else int(round(desired)) != int(cur)
             )
             if need_rec:
-                _reconcile_symbol_net_qty(
+                _reconcile_one_symbol_or_continue(
                     trading_client,
                     t,
                     desired,
@@ -662,51 +759,80 @@ def _run_cycle(
                     fractional=frac,
                 )
 
-    if proxy_sym:
-        bil_px = _sleeve_market_price(proxy_sym, paper=paper)
-        if use_bil_sleeve:
-            bil_usd = float(sleeve_notional)
-            if bil_usd < float(min_order_usd):
-                bil_desired = 0.0
-                bil_note = f" | skipped sleeve ${bil_usd:.2f} < min_order"
+    # Sleeve reconcile: iterate every ticker that could be held as part of the risk-off
+    # sleeve (from the snapshot when risk-off; from the config when risk-on so we can
+    # flatten stale sleeve positions). Each ticker sized off the sleeve notional * its
+    # weight inside the sleeve — or zero when the regime is risk-on.
+    sleeve_candidates: set[str] = set(sleeve_syms)
+    for s in sleeve_and_regime_symbols(config):
+        if s and s != mad_reference_ticker():
+            sleeve_candidates.add(s)
+    # Don't trade regime ETFs as sleeve members (they're signal-only).
+    for rt_s in _resolve_regime_tickers_cfg(config):
+        sleeve_candidates.discard(rt_s)
+
+    for sleeve_sym in sorted(sleeve_candidates):
+        # MRAT universe tickers are already reconciled above — only here when the symbol
+        # is sleeve-only (e.g. BIL / GLD / TLT not in MAD_UNIVERSE_TICKERS).
+        if sleeve_sym in snap.tickers:
+            continue
+        sleeve_px = _sleeve_market_price(sleeve_sym, paper=paper)
+        if use_sleeve and sleeve_sym in sleeve_targets:
+            sw = float(sleeve_targets[sleeve_sym])
+            sleeve_leg_usd = float(sleeve_notional) * abs(sw)
+            if sleeve_leg_usd < float(min_order_usd):
+                sleeve_desired = 0.0
+                sleeve_note = f" | skipped sleeve leg ${sleeve_leg_usd:.2f} < min_order"
             else:
-                bil_desired = _desired_qty_signed(1.0, bil_usd, bil_px, fractional=frac)
-                bil_note = ""
+                sleeve_desired = _desired_qty_signed(
+                    math.copysign(1.0, sw) if abs(sw) > 1e-12 else 0.0,
+                    sleeve_leg_usd,
+                    sleeve_px,
+                    fractional=frac,
+                )
+                sleeve_note = ""
         else:
-            bil_desired = 0.0
-            bil_note = ""
-        bil_cur_f = float(_get_current_qty(trading_client, proxy_sym))
-        bil_cur = _round_alpaca_qty(bil_cur_f) if frac else int(round(bil_cur_f))
-        bil_need_print = bool(bil_note) or (
-            abs(float(bil_desired) - float(bil_cur)) >= 1e-8
+            sleeve_desired = 0.0
+            sleeve_note = ""
+        cur_f = float(_get_current_qty(trading_client, sleeve_sym))
+        cur_sl = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
+        need_print = bool(sleeve_note) or (
+            abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
             if frac
-            else int(round(bil_desired)) != int(bil_cur)
+            else int(round(sleeve_desired)) != int(cur_sl)
         )
-        if bil_need_print:
-            px_disp = f"{bil_px:.4f}" if np.isfinite(bil_px) and bil_px > 0 else "market"
-            bd = _fmt_net_qty(bil_desired, fractional=frac)
-            bc = _fmt_net_qty(bil_cur, fractional=frac)
-            print(
-                f"  {proxy_sym}: sleeve={'risk-off full gross' if use_bil_sleeve else 'flat'} "
-                f"quote={px_disp} desired_net={bd} current={bc}{bil_note}"
+        if need_print:
+            px_disp = (
+                f"{sleeve_px:.4f}" if np.isfinite(sleeve_px) and sleeve_px > 0 else "market"
             )
-        bil_ref = (
-            bil_px
-            if np.isfinite(bil_px) and bil_px > 0 and (ext_hrs or frac)
+            bd = _fmt_net_qty(sleeve_desired, fractional=frac)
+            bc = _fmt_net_qty(cur_sl, fractional=frac)
+            state_s = (
+                f"risk-off w={sleeve_targets.get(sleeve_sym, 0.0):+.2%}"
+                if use_sleeve and sleeve_sym in sleeve_targets
+                else "flat (risk-on or not targeted)"
+            )
+            print(
+                f"  {sleeve_sym}: sleeve={state_s} "
+                f"quote={px_disp} desired_net={bd} current={bc}{sleeve_note}"
+            )
+        ref_px = (
+            sleeve_px
+            if np.isfinite(sleeve_px) and sleeve_px > 0 and (ext_hrs or frac)
             else None
         )
-        bil_need_rec = (
-            abs(float(bil_desired) - float(bil_cur)) >= 1e-8
+        need_rec = (
+            abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
             if frac
-            else int(round(bil_desired)) != int(bil_cur)
+            else int(round(sleeve_desired)) != int(cur_sl)
         )
-        if bil_need_rec:
-            _reconcile_symbol_net_qty(
+        if need_rec:
+            _reconcile_one_symbol_or_continue(
                 trading_client,
-                proxy_sym,
-                bil_desired,
+                sleeve_sym,
+                sleeve_desired,
                 extended_hours=ext_hrs,
-                reference_price=bil_ref,
+                reference_price=ref_px,
                 paper=paper,
                 fractional=frac,
             )
@@ -718,8 +844,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MAD / MRAT Alpaca live bot")
     parser.add_argument(
         "--once",
+        "--rebalance-once",
         action="store_true",
-        help="Run one reconcile cycle immediately, then exit (ignores EOD clock; use for cron).",
+        dest="once",
+        help=(
+            "Run one reconcile cycle immediately, then exit (ignores EOD clock). "
+            "Use after a deposit or anytime you want targets vs Alpaca aligned; "
+            "--rebalance-once is an alias."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -737,7 +869,6 @@ def main() -> None:
     _bm = str(getattr(config, "BOT_MODE", "paper")).strip().lower()
     mode = "PAPER" if _bm == "paper" else "CASH"
     panel_syms = mad_universe_tickers()
-    pipe_mode = str(getattr(config, "OHLCV_PIPELINE_MODE", "mad_universe")).strip()
     fetch_syms = tuple(config.ohlcv_pipeline_tickers())
     fetch_set = set(fetch_syms)
     missing_panel = sorted(set(panel_syms) - fetch_set)
@@ -748,17 +879,29 @@ def main() -> None:
         f"  OHLCV health ref: {_ohlcv_health_reference_ticker()}  (equity calendar when sleeve == ref)\n"
         f"  bar granularity : {config.TARGET_CANDLE_GRANULARITY}\n"
         f"  MAD panel       : {len(panel_syms)} names (MAD_UNIVERSE_TICKERS)\n"
-        f"  OHLCV pipeline  : {pipe_mode!r} → {len(fetch_syms)} fetch symbol(s) (``alpaca_fetcher``)\n"
+        f"  OHLCV pipeline  : {len(fetch_syms)} fetch symbol(s) (``alpaca_fetcher``)\n"
         f"  params          : MRAT {sh}/{lo} exit_MA={ex} regime_MA={reg_ma} ticker={regime_disp!r}\n"
         f"  optim DB        : {_mad_optim_db_path()} (load={getattr(config, 'MAD_LIVE_LOAD_PARAMS_FROM_DB', True)})\n"
         f"  rebalance       : EOD once/session after Alpaca calendar close (US/Eastern); "
         f"poll={poll}s is wake interval only\n"
-        f"  --once          : run one reconcile immediately (ignores EOD schedule)\n"
+        f"  --once / --rebalance-once: one immediate reconcile (ignores EOD schedule)\n"
         f"  extended_hours  : {getattr(config, 'MAD_LIVE_EXTENDED_HOURS_ORDERS', False)}\n"
         f"  fractional      : {getattr(config, 'MAD_LIVE_FRACTIONAL_SHARES', True)}\n"
-        f"  regime sleeve   : {getattr(config, 'MAD_LIVE_REGIME_OFF_PROXY_TICKER', None) or 'cash'}\n"
+        f"  regime sleeve   : {_format_sleeve_summary()}\n"
+        f"  weighting scheme: {getattr(config, 'MAD_WEIGHTING_SCHEME', 'equal')}\n"
         f"  dry_run         : {args.dry_run}\n"
     )
+    for _line in format_index_allocation_banner(config):
+        print(_line)
+    if index_allocator_enabled(config):
+        print(
+            "  multi-index live: ON — stock-picker runs per enabled slot, blended by\n"
+            "    ``evaluate_index_allocation_live`` (SPY/QQQ MRAT + 200D trend). Risk-off\n"
+            "    sleeve weight is the allocator's ``risk_off_share`` (progressive: scales\n"
+            "    with the number of slots below trend). Legacy sleeve-flatten path is\n"
+            "    bypassed — equity and sleeve co-exist on the same book when one slot\n"
+            "    passes trend and the other fails."
+        )
     if missing_panel:
         sample = ", ".join(missing_panel[:12])
         more = f" (+{len(missing_panel) - 12} more)" if len(missing_panel) > 12 else ""

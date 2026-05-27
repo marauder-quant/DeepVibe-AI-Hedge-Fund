@@ -21,11 +21,9 @@ from dash import Dash, dcc, html
 
 from deepvibe_hedge import config
 from deepvibe_hedge.mad.backtester import (
-    MAD_DEFAULT_MIN_NAMES_PER_DATE,
     MAD_DEFAULT_MIN_PRICE,
     aggregate_panel_to_daily,
     build_panel_long,
-    effective_min_names_per_date,
     evaluate_mad,
     mad_calendar_key,
     mad_reference_ticker,
@@ -129,7 +127,6 @@ def _load_is_dates_and_returns(strategy: dict) -> tuple[pd.Series, list[int]]:
     direction = getattr(config, "MAD_DIRECTION_MODE", "both")
     min_price = float(MAD_DEFAULT_MIN_PRICE)
     min_hist = int(getattr(config, "MAD_MIN_HISTORY_BARS", 252))
-    min_names = effective_min_names_per_date(daily_long, int(MAD_DEFAULT_MIN_NAMES_PER_DATE))
     rt = str(strategy.get("mad_regime_ticker", "") or "").strip().upper() or None
 
     _, eval_ctx = evaluate_mad(
@@ -138,7 +135,6 @@ def _load_is_dates_and_returns(strategy: dict) -> tuple[pd.Series, list[int]]:
         long_w=int(strategy["mad_sma_long"]),
         min_price=min_price,
         min_history=min_hist,
-        min_names=min_names,
         fee_rate=float(strategy["fee_rate"]),
         direction_mode=direction,
         eval_dates=eval_dset,

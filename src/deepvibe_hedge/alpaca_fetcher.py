@@ -23,8 +23,17 @@ def _filename(symbol: str) -> str:
 
 
 def save_to_db(df: pd.DataFrame, symbol: str) -> None:
+    """Write OHLCV DataFrame to ``{symbol}_{granularity}.db``.
+
+    Empty frames are skipped (no file written / existing file preserved) because
+    ``df.reset_index().to_sql`` on an empty DataFrame produces a malformed table
+    with just an ``index`` column that the splitter + panel loaders reject.
+    """
     OHLCV_DIR.mkdir(parents=True, exist_ok=True)
     path = OHLCV_DIR / f"{_filename(symbol)}.db"
+    if df is None or df.empty:
+        print(f"Skipped DB  → {path}: 0 bars returned by Alpaca (no file written).")
+        return
     with sqlite3.connect(path) as con:
         df.reset_index().to_sql("ohlcv", con, if_exists="replace", index=False)
     print(f"Saved to DB  → {path}")
@@ -33,6 +42,9 @@ def save_to_db(df: pd.DataFrame, symbol: str) -> None:
 def save_to_csv(df: pd.DataFrame, symbol: str) -> None:
     OHLCV_DIR.mkdir(parents=True, exist_ok=True)
     path = OHLCV_DIR / f"{_filename(symbol)}.csv"
+    if df is None or df.empty:
+        print(f"Skipped CSV → {path}: 0 bars returned by Alpaca.")
+        return
     df.to_csv(path)
     print(f"Saved to CSV → {path}")
 
@@ -183,15 +195,56 @@ def fetch_ohlcv_between(
     return df[cols].sort_index()
 
 
+def _resolve_cli_symbols(argv: list[str]) -> tuple[list[str], str]:
+    """Parse fetcher CLI args → (symbol list, human label).
+
+    Modes:
+
+    * no flag                → full pipeline (risk-on universe + hedge + index ETFs)
+    * ``--universe``         → only ``MAD_UNIVERSE_TICKERS`` (risk-on stocks)
+    * ``--hedge``            → only ``HEDGE_ASSETS`` (risk-off sleeve)
+    * ``--symbols A B C``    → ad-hoc list (uppercased, de-duped)
+    """
+    args = [a.strip() for a in argv if a.strip()]
+    if not args:
+        return list(config.ohlcv_pipeline_tickers()), "full pipeline (universe + hedge)"
+    flag = args[0].lower()
+    if flag in ("--universe", "--mad-universe", "--risk-on"):
+        raw = config.MAD_UNIVERSE_TICKERS
+        syms = (
+            [raw.strip().upper()]
+            if isinstance(raw, str)
+            else [str(x).strip().upper() for x in raw if str(x).strip()]
+        )
+        return syms, "MAD universe (risk-on)"
+    if flag in ("--hedge", "--hedge-assets", "--risk-off"):
+        return list(config.hedge_asset_tickers()), "hedge assets (risk-off)"
+    if flag in ("--symbols", "--syms", "-s"):
+        seen: list[str] = []
+        for a in args[1:]:
+            t = a.strip().upper()
+            if t and t not in seen:
+                seen.append(t)
+        if not seen:
+            raise SystemExit("--symbols requires at least one ticker")
+        return seen, f"ad-hoc symbols ({len(seen)})"
+    raise SystemExit(
+        f"Unknown fetcher flag {flag!r}. "
+        f"Use one of: --universe | --hedge | --symbols A B C"
+    )
+
+
 if __name__ == "__main__":
+    import sys as _sys
+
     from deepvibe_hedge.paths import ensure_data_dirs
 
     ensure_data_dirs()
-    symbols = config.ohlcv_pipeline_tickers()
+    symbols, label = _resolve_cli_symbols(_sys.argv[1:])
     _adj = historical_bar_adjustment()
     _end = config.ohlcv_download_end_utc()
     print(
-        f"Fetching {len(symbols)} symbol(s): {', '.join(symbols)} | "
+        f"Fetching {len(symbols)} symbol(s) [{label}]: {', '.join(symbols)} | "
         f"bar adjustment={_adj.value} | end_mode={config.OHLCV_DOWNLOAD_END_MODE!r} | end_utc={_end.isoformat()}"
     )
     client = _make_client()

@@ -128,25 +128,15 @@ def is_equity_shortable(
     return True
 
 
-def _default_ticker_from_config() -> str:
-    raw = getattr(config, "TARGET_TICKER", None)
-    if raw is None or not str(raw).strip():
-        raise RuntimeError("Set TARGET_TICKER in deepvibe_hedge.config (or pass a symbol on the CLI).")
-    return str(raw).strip().upper()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Query Alpaca shortable / ETB flags (works when market closed).")
-    parser.add_argument(
-        "symbol",
-        nargs="?",
-        default=None,
-        help="Ticker (omit to use TARGET_TICKER from deepvibe_hedge.config)",
-    )
+    parser.add_argument("symbol", help="Ticker to query (required).")
     parser.add_argument("--live", action="store_true", help="Use live keys (default: paper from config/env).")
     parser.add_argument("--require-etb", action="store_true", help="Also require easy_to_borrow.")
     args = parser.parse_args()
-    symbol = (args.symbol or "").strip().upper() or _default_ticker_from_config()
+    symbol = str(args.symbol).strip().upper()
+    if not symbol:
+        parser.error("symbol must be a non-empty ticker, e.g. `SPY`.")
     paper = not bool(args.live)
     client = trading_client_for_assets(paper=paper)
     info = fetch_equity_shortability(symbol, trading_client=client)
@@ -159,7 +149,6 @@ def main() -> None:
         f"{info.symbol}: tradable={info.tradable} shortable={info.shortable} "
         f"easy_to_borrow={info.easy_to_borrow} marginable={info.marginable}\n"
         f"is_equity_shortable(require_etb={args.require_etb}) -> {ok}"
-        + (f"\n(symbol from deepvibe_hedge.config TARGET_TICKER)" if not args.symbol else "")
     )
 
 

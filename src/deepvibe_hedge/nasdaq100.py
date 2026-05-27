@@ -1,6 +1,7 @@
 """NASDAQ-100 style equity universe (Alpaca symbols). Edit here; ``deepvibe_hedge.config`` imports this tuple."""
 
 nasdaq100 = (
+    "QQQ",    # Invesco QQQ Trust
     "NVDA",   # Nvidia
     "AAPL",   # Apple
     "MSFT",   # Microsoft

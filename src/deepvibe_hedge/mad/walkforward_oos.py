@@ -17,11 +17,9 @@ from dash import Dash, Input, Output, dash_table, dcc, html
 from deepvibe_hedge import config
 from deepvibe_hedge.breakout_plotting import comparison_stats_df, fig_equity, fig_trades, format_stats
 from deepvibe_hedge.mad.backtester import (
-    MAD_DEFAULT_MIN_NAMES_PER_DATE,
     MAD_DEFAULT_MIN_PRICE,
     aggregate_panel_to_daily,
     build_panel_long,
-    effective_min_names_per_date,
     evaluate_mad,
     mad_calendar_key,
     mad_reference_ticker,
@@ -183,7 +181,6 @@ def _oos_bundle_for_splits(
     direction: str,
     min_price: float,
     min_hist: int,
-    min_names: int,
 ) -> dict[str, object]:
     oos_dates = split_by_d[split_by_d.isin(selected_oos_splits)].index
     if len(oos_dates) == 0:
@@ -200,7 +197,6 @@ def _oos_bundle_for_splits(
         long_w=int(winner["mad_sma_long"]),
         min_price=min_price,
         min_history=min_hist,
-        min_names=min_names,
         fee_rate=float(winner["fee_rate"]),
         direction_mode=direction,
         eval_dates=eval_dset,
@@ -420,8 +416,6 @@ def main() -> None:
     direction = getattr(config, "MAD_DIRECTION_MODE", "both")
     min_price = float(MAD_DEFAULT_MIN_PRICE)
     min_hist = int(getattr(config, "MAD_MIN_HISTORY_BARS", 252))
-    min_names_cfg = int(MAD_DEFAULT_MIN_NAMES_PER_DATE)
-    min_names = effective_min_names_per_date(daily_long, min_names_cfg)
 
     bundles: list[dict[str, object]] = [
         _oos_bundle_for_splits(
@@ -433,7 +427,6 @@ def main() -> None:
             direction=direction,
             min_price=min_price,
             min_hist=min_hist,
-            min_names=min_names,
         )
     ]
     for sid in reserved_oos:
@@ -447,7 +440,6 @@ def main() -> None:
                 direction=direction,
                 min_price=min_price,
                 min_hist=min_hist,
-                min_names=min_names,
             )
         )
 

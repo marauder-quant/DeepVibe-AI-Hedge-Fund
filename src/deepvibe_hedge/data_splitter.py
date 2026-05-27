@@ -53,12 +53,25 @@ def print_loaded_config() -> None:
     )
 
 
-def _filename(ticker: str | None = None) -> str:
-    t = str(ticker or config.TARGET_TICKER).strip().upper()
+def _filename(ticker: str) -> str:
+    t = str(ticker).strip().upper()
+    if not t:
+        raise ValueError("data_splitter._filename: ticker argument is required (non-empty).")
     return f"{t}_{config.TARGET_CANDLE_GRANULARITY}"
 
 
-def load_ohlcv(ticker: str | None = None) -> pd.DataFrame:
+class EmptyOhlcvError(RuntimeError):
+    """Raised when an OHLCV DB exists but has no usable rows/columns.
+
+    Typical cause: a ticker returned zero bars from Alpaca (delisted, symbol
+    changed, no IEX trades in the window). The splitter's top-level runner
+    catches this and continues with the next symbol rather than halting.
+    """
+
+
+def load_ohlcv(ticker: str) -> pd.DataFrame:
+    if ticker is None or not str(ticker).strip():
+        raise ValueError("load_ohlcv: ticker argument is required (non-empty).")
     path = OHLCV_DIR / f"{_filename(ticker)}.db"
     if not path.exists():
         raise FileNotFoundError(
@@ -68,9 +81,15 @@ def load_ohlcv(ticker: str | None = None) -> pd.DataFrame:
         cols = [row[1] for row in con.execute("PRAGMA table_info(ohlcv)").fetchall()]
         wanted = [c for c in ("timestamp", "open", "high", "low", "close", "volume") if c in cols]
         if "timestamp" not in wanted:
-            raise RuntimeError("ohlcv table is missing required 'timestamp' column.")
+            raise EmptyOhlcvError(
+                f"ohlcv table at {path} is missing 'timestamp' column "
+                f"(found cols={cols}). Likely 0 bars returned by Alpaca; "
+                f"delete this DB to silence the warning or re-fetch the ticker."
+            )
         query = f"SELECT {', '.join(wanted)} FROM ohlcv"
         df = pd.read_sql(query, con, parse_dates=["timestamp"])
+    if df.empty:
+        raise EmptyOhlcvError(f"ohlcv table at {path} has 0 rows.")
     df = df.set_index("timestamp").sort_index()
     df.index = pd.to_datetime(df.index, utc=True)
     return df
@@ -256,7 +275,40 @@ if __name__ == "__main__":
     print_loaded_config()
     tickers = config.ohlcv_pipeline_tickers()
     print(f"\nData splitter — {len(tickers)} symbol(s): {', '.join(tickers)}\n")
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
     for sym in tickers:
         print(f"{'=' * 16} {sym} {'=' * 16}")
-        run_pipeline_for_ticker(sym)
+        try:
+            run_pipeline_for_ticker(sym)
+        except (EmptyOhlcvError, FileNotFoundError) as exc:
+            print(f"[{sym}] SKIPPED: {exc}")
+            skipped.append((sym, str(exc).splitlines()[0]))
+        except ValueError as exc:
+            # assign_splits raises ValueError when the DB has too few bars for the
+            # configured warmup — treat as "not enough history", not a hard fail.
+            print(f"[{sym}] SKIPPED (insufficient history): {exc}")
+            skipped.append((sym, f"insufficient history: {exc}"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{sym}] FAILED with unexpected error: {exc.__class__.__name__}: {exc}")
+            failed.append((sym, f"{exc.__class__.__name__}: {exc}"))
         print()
+
+    if skipped or failed:
+        print(f"\n{'=' * 16} Splitter pipeline summary {'=' * 16}")
+        print(f"Total symbols attempted : {len(tickers)}")
+        print(f"Succeeded               : {len(tickers) - len(skipped) - len(failed)}")
+        if skipped:
+            print(f"Skipped (empty / short) : {len(skipped)}")
+            for s, r in skipped[:20]:
+                print(f"  - {s}: {r}")
+            if len(skipped) > 20:
+                print(f"  ... and {len(skipped) - 20} more")
+        if failed:
+            print(f"Failed (unexpected)     : {len(failed)}")
+            for s, r in failed[:20]:
+                print(f"  - {s}: {r}")
+            if len(failed) > 20:
+                print(f"  ... and {len(failed) - 20} more")
+        if failed:
+            raise SystemExit(1)  # real unexpected errors → non-zero exit for CI/monitoring

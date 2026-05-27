@@ -34,8 +34,38 @@ def _regime_etf_symbol() -> str:
 
 
 def live_ohlcv_append_symbols() -> tuple[str, ...]:
+    """Every ticker the live snapshot reads → appended at the start of each EOD cycle.
+
+    Covers three pools so the snapshot always reads today's close + refreshed
+    SMAs (``sma_21`` / ``sma_200``):
+
+      1. Stock universe (``mad_universe_tickers()``) — in multi-index mode this
+         is the union of every enabled slot's constituents (e.g. QQQ + SPY
+         names), which also includes the slot ETFs themselves (QQQ, SPY) since
+         they're listed first in each slot universe.
+      2. Top-level regime ETF (``MAD_REGIME_TICKER``) — single-universe path
+         only; harmless duplicate when multi-index is on.
+      3. Risk-off sleeve (``config.HEDGE_ASSETS``) — bonds / metals / energy /
+         managed-futures / defensives / safe-harbor. Without this the sleeve
+         picks would score against stale closes from the last manual fetch.
+    """
     syms = set(mad_universe_tickers())
     syms.add(_regime_etf_symbol())
+    # Pull hedge-asset symbols directly from config (already the source of
+    # truth for ``MAD_REGIME_OFF_SLEEVE``) so new tickers added to
+    # ``hedge_assets.py`` automatically flow through — no second edit needed.
+    hedge = getattr(config, "HEDGE_ASSETS", None) or ()
+    if isinstance(hedge, str):
+        hedge = (hedge,)
+    for sym in hedge:
+        t = str(sym).strip().upper()
+        if t:
+            syms.add(t)
+    # Safe harbor is typically included in HEDGE_ASSETS already, but guard
+    # against a config where it's defined only in ``MAD_REGIME_OFF_SAFE_HARBOR``.
+    sh = (getattr(config, "MAD_REGIME_OFF_SAFE_HARBOR", "") or "").strip().upper()
+    if sh:
+        syms.add(sh)
     return tuple(sorted(syms))
 
 
@@ -56,8 +86,9 @@ def _merge_new_bars(existing: pd.DataFrame, new_bars: pd.DataFrame) -> pd.DataFr
         return existing
     new_bars = new_bars.copy()
     extra_cols = [c for c in existing.columns if c not in new_bars.columns]
-    for c in extra_cols:
-        new_bars[c] = np.nan
+    if extra_cols:
+        pad = pd.DataFrame(np.nan, index=new_bars.index, columns=extra_cols)
+        new_bars = pd.concat([new_bars, pad], axis=1)
     all_cols = sorted(set(existing.columns) | set(new_bars.columns))
     new_bars = new_bars.reindex(columns=all_cols)
     existing = existing.reindex(columns=all_cols)
@@ -67,17 +98,24 @@ def _merge_new_bars(existing: pd.DataFrame, new_bars: pd.DataFrame) -> pd.DataFr
 
 
 def _apply_live_sma_columns(df: pd.DataFrame, symbol_upper: str) -> pd.DataFrame:
+    """Refresh ``sma_21`` + ``sma_200`` on every symbol's DB.
+
+    Historically the single-universe regime ETF (``MAD_REGIME_TICKER``) only
+    needed ``sma_200`` for the trend gate, so ``sma_21`` was cleared as a
+    space-saver. In multi-index mode BOTH slot ETFs (e.g. QQQ + SPY) need both
+    SMAs — the allocator computes each ETF's MRAT as ``sma_21 / sma_200``.
+    Populating both everywhere is simpler and costs a few kB per DB.
+    Downstream loaders (``_load_daily_close_and_sma``) already fall back to
+    rolling-from-close when a column is missing, so this is a perf tweak
+    rather than a correctness fix — but having precomputed values available
+    keeps the EOD snapshot fast and consistent with splitter output.
+    """
     close = df["close"].astype(float)
     sma200 = close.rolling(200, min_periods=200).mean().round(4)
     sma21 = close.rolling(21, min_periods=21).mean().round(4)
-    regime = _regime_etf_symbol()
     out = df.copy()
-    if symbol_upper == regime:
-        out["sma_200"] = sma200
-        out["sma_21"] = np.nan
-    else:
-        out["sma_21"] = sma21
-        out["sma_200"] = sma200
+    out["sma_21"] = sma21
+    out["sma_200"] = sma200
     return out
 
 

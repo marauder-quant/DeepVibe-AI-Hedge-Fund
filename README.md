@@ -264,11 +264,30 @@ BOT_MODE = "paper"
 
 ---
 
-### 5. Default universe: Nasdaq-100
+### 5. Strategy configuration: the control panel in `config.py`
 
-You do **not** need to edit anything for your **first** run. In `config.py`, **`MAD_UNIVERSE_TICKERS`** is set to **`nasdaq100`**, and the pipeline mode loads that full list (plus the **QQQ** regime ticker when regime logic is enabled).
+Open **`src/deepvibe_hedge/config.py`**. The top of the file is a clearly-labeled **`STRATEGY CONTROL PANEL`** section with the ~10 knobs users actually tune. Everything below the control panel is plumbing.
 
-The first **download** can take a long time (many symbols and years of daily data). Let it finish; interrupting can leave partial data.
+The main decisions you typically adjust:
+
+| Knob | Purpose | Default |
+|------|--------|--------|
+| `MAD_INDEX_ALLOCATOR_ENABLED` | Multi-index allocator (supported in both backtest and live bot). | `True` |
+| `MAD_INDEX_ENABLED_ETFS` | Which indexes run (subset of `IWM`/`QQQ`/`SPY`, or `None` for all three). | `("QQQ", "SPY")` |
+| `MAD_WEIGHTING_SCHEME` | Risk-on stock picker weighting (seven schemes; see `config.py` section 3). | project default |
+| `MAD_INDEX_WEIGHTING_SCHEME` | Index allocator weighting across slots. | project default |
+| `MAD_SLEEVE_WEIGHTING_SCHEME` | Risk-off hedge basket weighting. | project default |
+| `MAD_STOCK_WEIGHTING_GRID_SEARCH` | If `True`, backtester sweeps **risk-on** stock schemes only (index + sleeve fixed). | `False` |
+| `MAD_SLEEVE_WEIGHTING_GRID_SEARCH` | If `True`, sweeps **risk-off** sleeve schemes only (stock + index fixed; one stock run + cached sleeve rebuilds). | `False` |
+| `MAD_INDEX_WEIGHTING_GRID_SEARCH` | If `True`, legacy **7×7** stock × index allocator sweep (ignored if either grid above is on). | `False` |
+
+Only **one** grid runs per backtest: precedence is **sleeve → stock → 7×7**. Leave all three `False` for a single run using the schemes in section 3.
+
+The default universe for the **single-universe fallback** (when `MAD_INDEX_ALLOCATOR_ENABLED = False`) is **Nasdaq-100** (`MAD_UNIVERSE_TICKERS = nasdaq100`) with **QQQ** as the regime ETF — you do not need to change anything for your first backtest run.
+
+**Live bot:** supports both modes. With the multi-index allocator on, the live bot runs the stock picker per enabled slot (`MAD_INDEX_ENABLED_ETFS`, e.g. SPY + QQQ), blends the books by each ETF's MRAT + 200D trend, and merges in the risk-off sleeve scaled by the allocator's `risk_off_share`. Single-universe mode still works when `MAD_INDEX_ALLOCATOR_ENABLED = False`.
+
+The first **data download** can take a long time (many symbols and years of daily data). Let it finish; interrupting can leave partial data.
 
 ---
 
@@ -416,7 +435,7 @@ The first MRAT panel build can take **several minutes** while it reads many SQLi
 | `src/deepvibe_hedge/mad/live_dashboard.py` | Dash live UI (dark theme in `mad/dash_assets/theme.css`) |
 | `src/deepvibe_hedge/paths.py` | `DATA_ROOT`, `OHLCV_DIR`, `MAD_DATA_DIR` |
 
-**Strategy summary:** MRAT ranks tickers by short-SMA / long-SMA vs the cross-section; σ-bands and deciles set long/short rules. Optional **regime** uses an ETF (default **QQQ**) to reduce exposure when the market is below a long moving average. Details: docstrings in `mad/backtester.py` and `config.py`.
+**Strategy summary:** MRAT ranks tickers by short-SMA / long-SMA vs the cross-section; σ-bands and deciles set long/short rules. When the **multi-index allocator** is on, the stock picker runs independently per enabled index sleeve (SPY / QQQ / IWM) and a top-level allocator blends them by index-ETF MRAT, routing failing slots to a risk-off sleeve (bonds + metals + defensive ETFs). Single-universe mode preserves the legacy regime-ETF trend filter (default **QQQ**) over one universe. Details: control-panel comments in `config.py` and docstrings in `mad/backtester.py`, `mad/index_allocator.py`, `mad/weighting.py`, and `mad/regime_sleeve.py`.
 
 **Related:** `mad/walkforward_oos.py`, `mad/permutation_test.py`; `reference_old_folder/` is legacy only.
 

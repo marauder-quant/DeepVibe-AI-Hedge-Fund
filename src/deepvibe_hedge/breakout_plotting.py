@@ -368,12 +368,30 @@ def fig_equity(
             line=dict(color="#888", dash="dot"),
         )
     )
+    strat_trace_kwargs: dict[str, object] = {}
+    if "sleeve_desc" in eval_df.columns or "regime_state" in eval_df.columns:
+        sleeve_desc = eval_df.get("sleeve_desc", pd.Series("", index=eval_df.index)).fillna("").astype(str)
+        regime_state = eval_df.get("regime_state", pd.Series("", index=eval_df.index)).fillna("").astype(str)
+        customdata = np.stack(
+            [sleeve_desc.reindex(strat_curve.index, fill_value="").to_numpy(),
+             regime_state.reindex(strat_curve.index, fill_value="").to_numpy()],
+            axis=-1,
+        )
+        strat_trace_kwargs["customdata"] = customdata
+        strat_trace_kwargs["hovertemplate"] = (
+            "%{x|%Y-%m-%d}<br>"
+            "Equity: %{y:.4f}<br>"
+            "Regime: %{customdata[1]}<br>"
+            "Allocation: %{customdata[0]}"
+            "<extra>" + strategy_curve_name + "</extra>"
+        )
     fig.add_trace(
         go.Scatter(
             x=strat_curve.index,
             y=strat_curve.values,
             name=strategy_curve_name,
             line=dict(color="#00d084"),
+            **strat_trace_kwargs,
         )
     )
     fig.add_trace(

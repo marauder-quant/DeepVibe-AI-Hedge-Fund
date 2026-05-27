@@ -35,7 +35,7 @@ import argparse
 import itertools
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import Any
 
@@ -54,29 +54,133 @@ from deepvibe_hedge.breakout_plotting import (
     format_stats,
 )
 from deepvibe_hedge.paths import MAD_DATA_DIR, OHLCV_DIR
+from deepvibe_hedge.mad.weighting import (
+    WeightConfig,
+    WeightInputs,
+    compute_weights,
+    realized_vol_pivot,
+    resolve_weight_config,
+)
+from deepvibe_hedge.mad.regime_sleeve import (
+    RegimeBacktestSeries,
+    build_regime_backtest_series,
+    describe_sleeve_config,
+    evaluate_regime_live,
+    evaluate_sleeve_allocation_live,
+    format_regime_state_line,
+    resolve_regime_ma,
+    resolve_regime_mode,
+    resolve_regime_tickers,
+    resolve_safe_harbor,
+    resolve_sleeve,
+    resolve_sleeve_mrat_pair,
+    resolve_sleeve_weight_config,
+    resolve_sleeve_weighting_scheme,
+)
+from deepvibe_hedge.mad.index_allocator import (
+    RISK_OFF_KEY,
+    build_index_allocation_series,
+    evaluate_index_allocation_live,
+    filter_universe_by_data_completeness,
+    format_index_allocation_banner,
+    index_allocator_enabled,
+    resolve_index_mrat_pair,
+    resolve_index_regime_ma,
+    resolve_index_slots,
+    resolve_index_weight_config,
+    resolve_min_data_completeness,
+)
 from deepvibe_hedge.walkforward_oos_common import read_explicit_split_plan_from_config, resolve_split_plan
 
 # Panel bar index and ``split`` ids: all universe names reindexed onto this symbol (``build_panel_long``).
-# Fixed so MRAT stays on an equity calendar even when ``TARGET_TICKER`` is a sleeve (e.g. BIL).
-MAD_PANEL_REFERENCE_TICKER = "QQQ"
+# Resolution order: first MAD_INDEX_SLOTS ETF (when allocator is on), else MAD_REGIME_TICKER.
+
+
+def mad_reference_ticker() -> str:
+    """Panel-calendar + ``RESULTS_DB`` reference ticker.
+
+    Under the multi-index allocator, there is no single "target" symbol — we
+    pick the first *enabled* slot's ETF (honoring ``MAD_INDEX_ENABLED_ETFS``
+    whitelist if set) as the calendar anchor. When the allocator is off, fall
+    back to ``MAD_REGIME_TICKER``.
+    """
+    if bool(getattr(config, "MAD_INDEX_ALLOCATOR_ENABLED", False)):
+        slots = getattr(config, "MAD_INDEX_SLOTS", ())
+        enabled_raw = getattr(config, "MAD_INDEX_ENABLED_ETFS", None)
+        enabled = (
+            {str(t).strip().upper() for t in enabled_raw if str(t).strip()}
+            if enabled_raw
+            else None
+        )
+        for entry in slots:
+            if not entry:
+                continue
+            etf = str(entry[0]).strip().upper()
+            if not etf:
+                continue
+            if enabled is not None and etf not in enabled:
+                continue
+            return etf
+    raw = getattr(config, "MAD_REGIME_TICKER", None)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().upper()
+    raise RuntimeError(
+        "mad_reference_ticker: need MAD_INDEX_SLOTS (allocator on) or "
+        "MAD_REGIME_TICKER (allocator off) to resolve a reference ticker."
+    )
 
 # Cross-sectional MRAT eligibility (not user config).
 MAD_DEFAULT_MIN_PRICE = 5.0
-MAD_DEFAULT_MIN_NAMES_PER_DATE = 30
-MAD_DEFAULT_MIN_NAMES_UNIVERSE_SLACK = 5
-MAD_DEFAULT_MIN_NAMES_ABS_FLOOR = 10
 
-RESULTS_DB = MAD_DATA_DIR / f"{MAD_PANEL_REFERENCE_TICKER}_{config.TARGET_CANDLE_GRANULARITY}_mad_optim.db"
+RESULTS_DB = MAD_DATA_DIR / f"{mad_reference_ticker()}_{config.TARGET_CANDLE_GRANULARITY}_mad_optim.db"
 DATASETS_DIR = MAD_DATA_DIR
 PORT = int(getattr(config, "MAD_DASHBOARD_PORT", 8063))
 
 
-def mad_reference_ticker() -> str:
-    return str(MAD_PANEL_REFERENCE_TICKER).strip().upper()
-
-
 def mad_universe_tickers() -> tuple[str, ...]:
-    raw = getattr(config, "MAD_UNIVERSE_TICKERS", (config.TARGET_TICKER,))
+    """Union of every ticker the MAD backtest / live bot can hold.
+
+    * Allocator ON  → union of every ``MAD_INDEX_SLOTS`` constituent universe
+      (deduped, preserving first-seen slot order). This is what
+      ``build_panel_long`` needs so ``evaluate_mad_multi_index`` can filter
+      ``daily_long`` to each slot's exclusive universe and actually find rows.
+    * Allocator OFF → legacy ``MAD_UNIVERSE_TICKERS`` only.
+
+    Raises if the resulting universe is empty.
+    """
+    if bool(getattr(config, "MAD_INDEX_ALLOCATOR_ENABLED", False)):
+        seen: list[str] = []
+        slots = getattr(config, "MAD_INDEX_SLOTS", ())
+        enabled_raw = getattr(config, "MAD_INDEX_ENABLED_ETFS", None)
+        enabled_set = (
+            {str(t).strip().upper() for t in enabled_raw if str(t).strip()}
+            if enabled_raw
+            else None
+        )
+        for entry in slots:
+            if not entry:
+                continue
+            etf_sym = str(entry[0]).strip().upper()
+            if enabled_set is not None and etf_sym not in enabled_set:
+                continue
+            univ = entry[1]
+            raw_univ = univ if not isinstance(univ, str) else (univ,)
+            for t in raw_univ:
+                tt = str(t).strip().upper()
+                if tt and tt not in seen:
+                    seen.append(tt)
+        if not seen:
+            raise RuntimeError(
+                "mad_universe_tickers: MAD_INDEX_ALLOCATOR_ENABLED=True but "
+                "MAD_INDEX_SLOTS produced an empty union of constituents."
+            )
+        return tuple(seen)
+
+    raw = getattr(config, "MAD_UNIVERSE_TICKERS", None)
+    if raw is None:
+        raise RuntimeError(
+            "mad_universe_tickers: MAD_UNIVERSE_TICKERS is unset in config."
+        )
     if isinstance(raw, str):
         return (raw.strip().upper(),)
     return tuple(str(x).strip().upper() for x in raw if str(x).strip())
@@ -207,6 +311,40 @@ def _load_regime_daily_close(
     return s
 
 
+def _load_sleeve_ret_piv(
+    tickers: tuple[str, ...],
+    granularity: str,
+    *,
+    daily_agg: bool,
+    ohlcv_dir: Path,
+) -> pd.DataFrame:
+    """Daily pct-change pivot for sleeve / safe-harbor tickers on the panel calendar.
+
+    Columns match ``tickers`` exactly (missing DBs emit NaN so the caller falls back
+    to zero weights for that symbol). Returns are ``close.pct_change()`` — same convention
+    as ``daily_ret`` in the MRAT panel.
+    """
+    if not tickers:
+        return pd.DataFrame()
+    frames: dict[str, pd.Series] = {}
+    for sym in tickers:
+        path = ohlcv_dir / f"{sym}_{granularity}.db"
+        if not path.exists():
+            continue
+        try:
+            close = _load_regime_daily_close(
+                sym, granularity, ohlcv_dir, aggregate_to_daily=daily_agg
+            )
+        except Exception:
+            continue
+        frames[sym] = close.pct_change()
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, axis=1, sort=False).sort_index()
+    df.index = pd.DatetimeIndex(df.index, tz="UTC")
+    return df
+
+
 def _regime_entry_allow_series(close: pd.Series, ma_period: int) -> pd.Series:
     """Same bar timing as MRAT: risk-on today uses prior close vs SMA (shift(1))."""
     if int(ma_period) <= 0:
@@ -214,6 +352,62 @@ def _regime_entry_allow_series(close: pd.Series, ma_period: int) -> pd.Series:
     sma = _sma(close, int(ma_period))
     above = close > sma
     return above.shift(1).fillna(False).astype(bool)
+
+
+def resolve_backtest_window() -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    """Resolve ``MAD_BACKTEST_START_DATE`` / ``MAD_BACKTEST_END_DATE`` from config.
+
+    Returns a ``(start_ts, end_ts)`` tuple of UTC-normalized ``pd.Timestamp`` (or
+    ``None`` when the bound is unset). Used to trim both the strategy and the
+    buy-and-hold benchmark to the same eval window, so the dashboard doesn't
+    show a long flat warmup stretch while B&H is already fully invested.
+    """
+    def _parse(val: object) -> pd.Timestamp | None:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        ts = pd.Timestamp(s)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.normalize()
+
+    start = _parse(getattr(config, "MAD_BACKTEST_START_DATE", None))
+    end = _parse(getattr(config, "MAD_BACKTEST_END_DATE", None))
+    if start is not None and end is not None and end < start:
+        raise RuntimeError(
+            f"MAD_BACKTEST_END_DATE ({end.date()}) is before MAD_BACKTEST_START_DATE ({start.date()})."
+        )
+    return start, end
+
+
+def _eval_dates_from_window(
+    calendar_like,
+    start: pd.Timestamp | None,
+    end: pd.Timestamp | None,
+) -> set | None:
+    """Build an ``eval_dates`` set (calendar keys) from a window + a candidate
+    index / iterable of timestamps. Returns ``None`` when both bounds are unset
+    so downstream code keeps its "no restriction" fast path.
+    """
+    if start is None and end is None:
+        return None
+    idx = pd.DatetimeIndex(list(calendar_like))
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+    idx = idx.normalize()
+    mask = pd.Series(True, index=idx, dtype=bool)
+    if start is not None:
+        mask &= idx >= start
+    if end is not None:
+        mask &= idx <= end
+    kept = idx[mask.to_numpy()]
+    return {mad_calendar_key(d) for d in kept}
 
 
 def mad_regime_ticker_symbol() -> str | None:
@@ -291,22 +485,6 @@ def mad_calendar_key(ts: pd.Timestamp | np.datetime64 | object) -> pd.Timestamp:
     return t.normalize()
 
 
-def effective_min_names_per_date(daily_long: pd.DataFrame, configured: int) -> int:
-    """
-    Cross-sectional filter cannot require more names than exist in the universe.
-    If configured min is 30 but only 12 tickers load, use 12 or every day fails the filter.
-    When the cap hits n exactly, optional slack avoids blanking almost every day when one or two
-    symbols lack a bar (see ``MAD_DEFAULT_MIN_NAMES_UNIVERSE_SLACK``).
-    """
-    n = int(daily_long["ticker"].nunique())
-    raw = min(int(configured), n)
-    slack = int(MAD_DEFAULT_MIN_NAMES_UNIVERSE_SLACK)
-    floor = int(MAD_DEFAULT_MIN_NAMES_ABS_FLOOR)
-    if slack > 0 and raw == n and n > 1:
-        raw = max(floor, n - slack)
-    return raw
-
-
 def compute_mrat_panel(
     daily_long: pd.DataFrame,
     *,
@@ -314,7 +492,6 @@ def compute_mrat_panel(
     long_w: int,
     min_price: float,
     min_history: int,
-    min_names: int,
     direction_mode: str,
     long_sigma_mult: float | None = None,
     short_sigma_mult: float | None = None,
@@ -395,8 +572,6 @@ def compute_mrat_panel(
     sig = work.groupby("date", sort=True)["mrat"].transform("std")
     work["sigma"] = sig
     work["decile"] = work.groupby("date", sort=True)["mrat"].transform(_decile_rank_pct)
-    n_per = work.groupby("date")["ticker"].transform("count")
-    work.loc[n_per < int(min_names), ["sigma", "decile"]] = np.nan
 
     work["signal"] = 0
     long_ok = (work["decile"] >= ld_min) & (work["mrat"] > 1.0 + lsm * work["sigma"])
@@ -456,7 +631,15 @@ def _weights_from_entries(entry_row: pd.Series) -> pd.Series:
 
 @dataclass(frozen=True)
 class MadLiveSnapshot:
-    """Last completed calendar row MRAT targets for the next session (matches backtest signal → next-day hold)."""
+    """Last completed calendar row MRAT targets for the next session (matches backtest signal → next-day hold).
+
+    ``weight_by_ticker`` always spans the MAD universe; on risk-off sessions the MRAT
+    columns are zero and ``sleeve_weight_by_ticker`` carries the risk-off allocation
+    (see ``mad.regime_sleeve``). The live bot should trade the union of both maps.
+
+    ``regime_info`` is a human-readable summary for logs / dashboards (``format_regime_state_line``
+    output). ``weighting_scheme`` is the resolved scheme name (``MAD_WEIGHTING_SCHEME``).
+    """
 
     as_of: pd.Timestamp
     tickers: tuple[str, ...]
@@ -469,6 +652,10 @@ class MadLiveSnapshot:
     mad_regime_ma: int
     n_long: int
     n_short: int
+    sleeve_weight_by_ticker: dict[str, float] = field(default_factory=dict)
+    sleeve_close_by_ticker: dict[str, float] = field(default_factory=dict)
+    regime_info: str = ""
+    weighting_scheme: str = "equal"
 
 
 def _regime_risk_on_from_db_precomputed(
@@ -511,16 +698,24 @@ def _build_mad_live_mrat_panel(
     regime_ticker: str | None = None,
     ohlcv_dir: Path | None = None,
     direction_mode: str | None = None,
-) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame, bool, pd.Series]:
+    universe: tuple[str, ...] | None = None,
+    reference_ticker: str | None = None,
+) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame, bool, pd.Series, dict[str, float], dict[str, float], str]:
     """
     Shared OHLCV → MRAT panel for live bot and dashboard.
 
     Returns ``panel`` (all dates), ``last_date`` (UTC), ``sub`` (last-day rows per ticker),
-    ``regime_ok``, and ``sig_series`` aligned to ``mad_universe_tickers()``.
+    ``regime_ok``, ``sig_series`` aligned to the resolved universe, and the risk-off sleeve
+    ``(weights_by_ticker, closes_by_ticker, info_line)`` derived from ``mad.regime_sleeve``.
+
+    ``universe`` / ``reference_ticker`` default to ``mad_universe_tickers()`` /
+    ``mad_reference_ticker()`` (legacy single-panel behavior). Callers wiring the
+    multi-index live allocator pass a per-slot universe + ETF override so each
+    slot is picked independently.
     """
     odir = ohlcv_dir or OHLCV_DIR
-    ref = mad_reference_ticker()
-    universe = mad_universe_tickers()
+    ref = reference_ticker if reference_ticker else mad_reference_ticker()
+    universe = universe if universe else mad_universe_tickers()
     gran = str(config.TARGET_CANDLE_GRANULARITY)
     daily_agg = bool(getattr(config, "MAD_AGGREGATE_TO_DAILY", True)) and gran.lower() != "1d"
     dm = direction_mode if direction_mode is not None else getattr(config, "MAD_DIRECTION_MODE", "both")
@@ -543,15 +738,12 @@ def _build_mad_live_mrat_panel(
         dl["date"] = pd.to_datetime(dl["timestamp"], utc=True).dt.normalize()
         daily_long = dl.drop(columns=["timestamp"], errors="ignore")
 
-    min_names_cfg = int(MAD_DEFAULT_MIN_NAMES_PER_DATE)
-    min_names = effective_min_names_per_date(daily_long, min_names_cfg)
     panel = compute_mrat_panel(
         daily_long,
         short_w=int(short_w),
         long_w=int(long_w),
         min_price=float(MAD_DEFAULT_MIN_PRICE),
         min_history=int(getattr(config, "MAD_MIN_HISTORY_BARS", 252)),
-        min_names=min_names,
         direction_mode=str(dm),
         exit_ma_period=int(exit_ma_period or 0),
         prefer_precomputed_sma=use_pc,
@@ -569,18 +761,72 @@ def _build_mad_live_mrat_panel(
     sub = panel.loc[dcol == last_date].drop_duplicates(subset=["ticker"], keep="last")
     sig_series = sub.set_index("ticker")["signal"].reindex(list(universe)).fillna(0).astype(int)
 
-    rt = regime_ticker
-    if rt is None:
-        rt = mad_regime_ticker_symbol()
-    regime_ok = _regime_risk_on_for_next_session(
-        int(regime_ma_period or 0),
-        rt,
-        gran,
-        daily_agg,
-        odir,
-        prefer_precomputed_sma=use_pc,
-    )
-    return panel, last_date, sub, regime_ok, sig_series
+    # Multi-ticker regime + sleeve (``mad.regime_sleeve``). An explicit ``regime_ticker`` override
+    # collapses to a single-ticker gate (live bot preserves its override semantics); otherwise
+    # we honor the full ``MAD_REGIME_TICKERS`` list plus the trend-gated sleeve composition.
+    reg_ma = int(regime_ma_period or 0)
+    mode = resolve_regime_mode(config)
+    sleeve = resolve_sleeve(config)
+    safe_harbor = resolve_safe_harbor(config)
+    if regime_ticker is not None and str(regime_ticker).strip():
+        regime_tickers = (str(regime_ticker).strip().upper(),)
+    else:
+        regime_tickers = resolve_regime_tickers(config) or (
+            (mad_regime_ticker_symbol() or "QQQ"),
+        )
+
+    if reg_ma <= 0 or not regime_tickers:
+        regime_ok = True
+        sleeve_weights: dict[str, float] = {}
+        sleeve_closes: dict[str, float] = {}
+        info_line = "regime off (no filter)"
+    else:
+        try:
+            state = evaluate_regime_live(
+                ohlcv_dir=odir,
+                granularity=gran,
+                aggregate_to_daily=daily_agg,
+                regime_tickers=regime_tickers,
+                regime_ma=reg_ma,
+                mode=mode,
+                sleeve=sleeve,
+                safe_harbor=safe_harbor,
+                prefer_precomputed_sma=use_pc,
+                sleeve_weight_cfg=resolve_sleeve_weight_config(config),
+                sleeve_mrat_pair=resolve_sleeve_mrat_pair(config),
+            )
+        except FileNotFoundError as exc:
+            print(f"[MAD] regime_sleeve fallback — {exc}")
+            regime_ok = _regime_risk_on_for_next_session(
+                reg_ma,
+                regime_tickers[0],
+                gran,
+                daily_agg,
+                odir,
+                prefer_precomputed_sma=use_pc,
+            )
+            sleeve_weights = {}
+            sleeve_closes = {}
+            info_line = (
+                f"regime[{mode} {reg_ma}D] (legacy fallback: {regime_tickers[0]}) "
+                f"{'RISK-ON' if regime_ok else 'RISK-OFF'}"
+            )
+        else:
+            regime_ok = bool(state.risk_on)
+            sleeve_weights = dict(state.sleeve_weights)
+            sleeve_closes = {}
+            for sym in sleeve_weights:
+                try:
+                    path = odir / f"{sym}_{gran}.db"
+                    with sqlite3.connect(path) as con:
+                        row = con.execute(
+                            "SELECT close FROM ohlcv ORDER BY timestamp DESC LIMIT 1"
+                        ).fetchone()
+                    sleeve_closes[sym] = float(row[0]) if row and row[0] is not None else float("nan")
+                except Exception:
+                    sleeve_closes[sym] = float("nan")
+            info_line = format_regime_state_line(state, regime_ma=reg_ma, mode=mode)
+    return panel, last_date, sub, regime_ok, sig_series, sleeve_weights, sleeve_closes, info_line
 
 
 def mad_live_watchlist_reason(
@@ -664,6 +910,44 @@ def mad_live_watchlist_reason(
     return "Flat"
 
 
+def _live_weight_inputs_from_sub(
+    sub: pd.DataFrame,
+    sig_series: pd.Series,
+    *,
+    realized_vol_lookback: int,
+    panel: pd.DataFrame,
+) -> WeightInputs:
+    """Per-ticker MRAT/σ/decile + realized vol from the last panel date for live sizing."""
+    idxed = sub.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")
+
+    def _col(name: str) -> pd.Series:
+        if name in idxed.columns:
+            s = idxed[name].astype(float).reindex(sig_series.index)
+        else:
+            s = pd.Series(np.nan, index=sig_series.index, dtype=float)
+        return s
+
+    mrat = _col("mrat")
+    decile = _col("decile")
+    sig_vals = idxed["sigma"].astype(float) if "sigma" in idxed.columns else pd.Series(dtype=float)
+    sigma_val = float(sig_vals.dropna().iloc[0]) if not sig_vals.dropna().empty else float("nan")
+
+    rvol: pd.Series | None = None
+    if realized_vol_lookback and realized_vol_lookback >= 2 and "daily_ret" in panel.columns:
+        piv = realized_vol_pivot(panel, lookback=int(realized_vol_lookback))
+        if not piv.empty:
+            last_row = piv.iloc[-1]
+            rvol = last_row.reindex(sig_series.index).astype(float)
+
+    return WeightInputs(
+        entry_signal=sig_series,
+        mrat=mrat,
+        sigma=sigma_val,
+        decile=decile,
+        realized_vol=rvol,
+    )
+
+
 def _mad_live_pack_snapshot(
     panel: pd.DataFrame,
     last_date: pd.Timestamp,
@@ -675,10 +959,30 @@ def _mad_live_pack_snapshot(
     long_w: int,
     exit_ma_period: int,
     regime_ma_period: int,
+    sleeve_weights: dict[str, float] | None = None,
+    sleeve_close_by_ticker: dict[str, float] | None = None,
+    regime_info: str = "",
+    weight_cfg: WeightConfig | None = None,
+    universe: tuple[str, ...] | None = None,
 ) -> MadLiveSnapshot:
-    universe = mad_universe_tickers()
+    """Pack a per-slot (or single-panel) ``MadLiveSnapshot``.
+
+    ``universe`` lets the multi-index live path scope a slot's MRAT book to its
+    own constituent list; defaults to ``mad_universe_tickers()`` for the legacy
+    single-panel call sites.
+    """
+    universe = universe if universe else mad_universe_tickers()
+    cfg = weight_cfg or resolve_weight_config(config)
+
     if regime_ok:
-        w = _weights_from_entries(sig_series)
+        sig_aligned = sig_series.reindex(universe).fillna(0).astype(int)
+        inp = _live_weight_inputs_from_sub(
+            sub,
+            sig_aligned,
+            realized_vol_lookback=cfg.realized_vol_lookback,
+            panel=panel,
+        )
+        w = compute_weights(inp, cfg)
     else:
         w = pd.Series(0.0, index=universe, dtype=float)
 
@@ -707,6 +1011,10 @@ def _mad_live_pack_snapshot(
         mad_regime_ma=int(regime_ma_period or 0),
         n_long=n_long,
         n_short=n_short,
+        sleeve_weight_by_ticker=dict(sleeve_weights or {}),
+        sleeve_close_by_ticker=dict(sleeve_close_by_ticker or {}),
+        regime_info=regime_info,
+        weighting_scheme=cfg.scheme,
     )
 
 
@@ -721,7 +1029,16 @@ def compute_mad_live_panel_and_snapshot(
     direction_mode: str | None = None,
 ) -> tuple[pd.DataFrame, MadLiveSnapshot, pd.DataFrame]:
     """Full MRAT panel, live snapshot, and last-day panel rows (one DB pass)."""
-    panel, last_date, sub, regime_ok, sig_series = _build_mad_live_mrat_panel(
+    (
+        panel,
+        last_date,
+        sub,
+        regime_ok,
+        sig_series,
+        sleeve_w,
+        sleeve_c,
+        info_line,
+    ) = _build_mad_live_mrat_panel(
         short_w=short_w,
         long_w=long_w,
         exit_ma_period=exit_ma_period,
@@ -740,6 +1057,9 @@ def compute_mad_live_panel_and_snapshot(
         long_w=long_w,
         exit_ma_period=exit_ma_period,
         regime_ma_period=regime_ma_period,
+        sleeve_weights=sleeve_w,
+        sleeve_close_by_ticker=sleeve_c,
+        regime_info=info_line,
     )
     return panel, snap, sub
 
@@ -848,7 +1168,16 @@ def compute_mad_live_snapshot(
     the splitter-rounded SMAs. Missing columns fall back to rolling ``close``. Regime precomputed path
     applies only for ``TARGET_CANDLE_GRANULARITY`` ``1d``.
     """
-    panel, last_date, sub, regime_ok, sig_series = _build_mad_live_mrat_panel(
+    (
+        panel,
+        last_date,
+        sub,
+        regime_ok,
+        sig_series,
+        sleeve_w,
+        sleeve_c,
+        info_line,
+    ) = _build_mad_live_mrat_panel(
         short_w=short_w,
         long_w=long_w,
         exit_ma_period=exit_ma_period,
@@ -867,7 +1196,347 @@ def compute_mad_live_snapshot(
         long_w=long_w,
         exit_ma_period=exit_ma_period,
         regime_ma_period=regime_ma_period,
+        sleeve_weights=sleeve_w,
+        sleeve_close_by_ticker=sleeve_c,
+        regime_info=info_line,
     )
+
+
+def compute_mad_multi_index_live_snapshot(
+    *,
+    short_w: int,
+    long_w: int,
+    exit_ma_period: int,
+    ohlcv_dir: Path | None = None,
+    direction_mode: str | None = None,
+) -> MadLiveSnapshot:
+    """Live snapshot for the multi-index allocator (mirror of ``evaluate_mad_multi_index``).
+
+    Flow (last-bar, matches MRAT entry timing via ``shift(1)`` inside helpers):
+
+      1. ``resolve_index_slots(config)`` returns the enabled ``IndexSlot``s
+         (respects ``MAD_INDEX_ENABLED_ETFS``).
+      2. ``evaluate_index_allocation_live`` computes per-ETF allocation weights
+         + ``risk_off_share`` from each ETF's latest MRAT + 200D trend gate.
+      3. For each slot with a non-zero allocation weight, run the stock picker
+         scoped to that slot's exclusive universe + ETF (via
+         ``_build_mad_live_mrat_panel`` with ``universe`` / ``reference_ticker``
+         overrides). The picker's ``regime_ma_period=0`` here — the allocator's
+         top-level trend gate already decided the slot gets equity exposure.
+      4. Risk-off sleeve composition (hedge-asset basket with dynamic weighting
+         when ``MAD_SLEEVE_WEIGHTING_SCHEME`` is set) is loaded via
+         ``evaluate_sleeve_allocation_live`` — unconditional on top-level regime
+         because the allocator may be mixing equity + sleeve on the same day.
+      5. Final ticker weights:
+            w_equity[t]  = slot_weight[slot.etf] * stock_pick_weight[t]
+            w_sleeve[t]  = risk_off_share * sleeve_weight[t]
+         Both maps are merged into ``weight_by_ticker`` (a single flat dict)
+         so the live bot's reconcile loop can size them uniformly against one
+         gross-notional value (no separate sleeve-notional path, unlike the
+         legacy single-universe risk-off branch).
+
+    The returned snapshot's ``sleeve_weight_by_ticker`` is always empty in
+    multi-index mode — the ``close_all_non_proxy`` / sleeve-gross branch is
+    bypassed, since the book holds equity and sleeve simultaneously.
+    """
+    odir = ohlcv_dir or OHLCV_DIR
+    gran = str(config.TARGET_CANDLE_GRANULARITY)
+    daily_agg = bool(getattr(config, "MAD_AGGREGATE_TO_DAILY", True)) and gran.lower() != "1d"
+    use_pc = bool(getattr(config, "MAD_LIVE_USE_PRECOMPUTED_SMA", True))
+
+    slots = resolve_index_slots(config)
+    if not slots:
+        raise RuntimeError(
+            "compute_mad_multi_index_live_snapshot: no enabled index slots "
+            "(check MAD_INDEX_SLOTS / MAD_INDEX_ENABLED_ETFS in config)."
+        )
+
+    # --- 1. Top-level allocation (per-ETF + risk-off share) from latest bar. --------
+    allocation = evaluate_index_allocation_live(
+        slots=slots,
+        regime_ma=resolve_index_regime_ma(config),
+        mrat_pair=resolve_index_mrat_pair(config),
+        weight_cfg=resolve_index_weight_config(config),
+        granularity=gran,
+        ohlcv_dir=odir,
+        aggregate_to_daily=daily_agg,
+        prefer_precomputed_sma=use_pc,
+    )
+    idx_weights = dict(allocation.index_weights)
+    risk_off_share = float(allocation.risk_off_weight)
+
+    # --- 2. Per-slot stock picker. Only run for slots with non-zero allocation. -----
+    per_slot_weights: dict[str, dict[str, float]] = {}
+    per_slot_closes: dict[str, dict[str, float]] = {}
+    per_slot_as_of: dict[str, pd.Timestamp] = {}
+    per_slot_n_long: dict[str, int] = {}
+    per_slot_n_short: dict[str, int] = {}
+    weight_cfg = resolve_weight_config(config)
+
+    for slot in slots:
+        slot_w = float(idx_weights.get(slot.etf, 0.0))
+        if slot_w <= 1e-12:
+            continue  # slot failed trend gate; no stock-picker work needed
+        if not slot.universe:
+            continue
+        slot_univ = tuple(slot.universe)
+        try:
+            (panel, last_date, sub, _regime_ok_unused, sig_series,
+             _sleeve_unused, _closes_unused, _info_unused) = _build_mad_live_mrat_panel(
+                short_w=int(short_w),
+                long_w=int(long_w),
+                exit_ma_period=int(exit_ma_period or 0),
+                # The allocator's own per-ETF trend gate already decided this
+                # slot gets equity. Disable the per-slot regime filter so the
+                # picker doesn't zero out weights via a redundant second gate.
+                regime_ma_period=0,
+                regime_ticker=None,
+                ohlcv_dir=odir,
+                direction_mode=direction_mode,
+                universe=slot_univ,
+                reference_ticker=slot.etf,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{slot.etf}] SKIP live snapshot: {exc}")
+            continue
+
+        slot_snap = _mad_live_pack_snapshot(
+            panel,
+            last_date,
+            sub,
+            True,  # regime_ok — decided at the allocator layer
+            sig_series,
+            short_w=int(short_w),
+            long_w=int(long_w),
+            exit_ma_period=int(exit_ma_period or 0),
+            regime_ma_period=0,
+            universe=slot_univ,
+        )
+        per_slot_weights[slot.etf] = dict(slot_snap.weight_by_ticker)
+        per_slot_closes[slot.etf] = dict(slot_snap.close_by_ticker)
+        per_slot_as_of[slot.etf] = slot_snap.as_of
+        per_slot_n_long[slot.etf] = slot_snap.n_long
+        per_slot_n_short[slot.etf] = slot_snap.n_short
+
+    # --- 3. Risk-off sleeve composition (always build, scale by risk_off_share). ----
+    sleeve_w_raw: dict[str, float] = {}
+    sleeve_closes: dict[str, float] = {}
+    if risk_off_share > 1e-12:
+        try:
+            sleeve_w_raw, _per_sleeve = evaluate_sleeve_allocation_live(
+                ohlcv_dir=odir,
+                granularity=gran,
+                aggregate_to_daily=daily_agg,
+                sleeve=resolve_sleeve(config),
+                safe_harbor=resolve_safe_harbor(config),
+                prefer_precomputed_sma=use_pc,
+                sleeve_weight_cfg=resolve_sleeve_weight_config(config),
+                sleeve_mrat_pair=resolve_sleeve_mrat_pair(config),
+            )
+        except FileNotFoundError as exc:
+            print(f"[multi-index live] sleeve load failed, safe-harbor fallback: {exc}")
+            sh = (resolve_safe_harbor(config) or "").strip().upper()
+            if sh:
+                sleeve_w_raw = {sh: 1.0}
+        for sym in sleeve_w_raw:
+            try:
+                path = odir / f"{sym}_{gran}.db"
+                with sqlite3.connect(path) as con:
+                    row = con.execute(
+                        "SELECT close FROM ohlcv ORDER BY timestamp DESC LIMIT 1"
+                    ).fetchone()
+                sleeve_closes[sym] = float(row[0]) if row and row[0] is not None else float("nan")
+            except Exception:
+                sleeve_closes[sym] = float("nan")
+
+    # --- 4. Merge per-slot equity + sleeve into one flat ticker-weight map. ---------
+    merged_weights: dict[str, float] = {}
+    merged_closes: dict[str, float] = {}
+    for etf, slot_w in idx_weights.items():
+        if slot_w <= 1e-12 or etf not in per_slot_weights:
+            continue
+        for t, stock_w in per_slot_weights[etf].items():
+            merged_weights[t] = merged_weights.get(t, 0.0) + float(slot_w) * float(stock_w)
+            if t not in merged_closes:
+                merged_closes[t] = per_slot_closes[etf].get(t, float("nan"))
+    for sym, s_w in sleeve_w_raw.items():
+        merged_weights[sym] = merged_weights.get(sym, 0.0) + risk_off_share * float(s_w)
+        if sym not in merged_closes:
+            merged_closes[sym] = sleeve_closes.get(sym, float("nan"))
+
+    # Stable ordering: slots in priority order → their constituents → sleeve tickers.
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for slot in slots:
+        for t in per_slot_weights.get(slot.etf, {}):
+            if t not in seen:
+                ordered.append(t)
+                seen.add(t)
+    for sym in sleeve_w_raw:
+        if sym not in seen:
+            ordered.append(sym)
+            seen.add(sym)
+    tickers_tuple = tuple(ordered)
+
+    # --- 5. Build diagnostics + final snapshot. -------------------------------------
+    if per_slot_as_of:
+        as_of = max(per_slot_as_of.values())
+    else:
+        as_of = pd.Timestamp.now(tz="UTC").normalize()
+
+    idx_parts = [
+        f"{etf}={idx_weights.get(etf, 0.0):.0%}"
+        for etf in (s.etf for s in slots)
+        if idx_weights.get(etf, 0.0) > 1e-12
+    ]
+    info_line = (
+        f"multi-index | risk_off={risk_off_share:.1%}"
+        + (f" | {' / '.join(idx_parts)}" if idx_parts else "")
+    )
+
+    return MadLiveSnapshot(
+        as_of=as_of,
+        tickers=tickers_tuple,
+        weight_by_ticker={t: merged_weights.get(t, 0.0) for t in tickers_tuple},
+        close_by_ticker={t: merged_closes.get(t, float("nan")) for t in tickers_tuple},
+        # ``regime_ok`` is True whenever any equity allocation exists — the live
+        # bot uses this flag to decide whether to route through the legacy
+        # sleeve-flatten branch. In multi-index mode we always want the unified
+        # sizing loop (equity and sleeve coexist), so only flag risk-off when
+        # the allocator is 100% risk-off.
+        regime_ok=(risk_off_share < 1.0 - 1e-9),
+        mad_sma_short=int(short_w),
+        mad_sma_long=int(long_w),
+        mad_exit_ma=int(exit_ma_period or 0),
+        mad_regime_ma=int(resolve_index_regime_ma(config) or 0),
+        n_long=int(sum(per_slot_n_long.values())),
+        n_short=int(sum(per_slot_n_short.values())),
+        # Intentionally empty in multi-index mode: sleeve weights are merged
+        # into ``weight_by_ticker`` above so the live bot sizes them uniformly
+        # against the equity gross notional (no separate sleeve-gross / flatten
+        # branch). Kept as a dict (not None) to preserve the dataclass type.
+        sleeve_weight_by_ticker={},
+        sleeve_close_by_ticker={},
+        regime_info=info_line,
+        weighting_scheme=weight_cfg.scheme,
+    )
+
+
+def _format_regime_sleeve_banner(
+    regime_sym: str | None,
+    regime_grid: tuple[int, ...],
+) -> list[str]:
+    """Multi-line banner for the risk-on/off regime + sleeve.
+
+    Falls back to the single-ticker / cash-only description when ``MAD_REGIME_TICKERS`` or
+    ``MAD_REGIME_OFF_SLEEVE`` aren't configured (legacy behavior).
+
+    When ``MAD_INDEX_ALLOCATOR_ENABLED`` is True, the legacy global regime line is
+    replaced with a per-slot trend-filter description (each index slot is gated
+    against its own ETF's SMA inside the allocator, so the global regime doesn't
+    apply).
+    """
+    allocator_on = index_allocator_enabled(config)
+    sleeve = resolve_sleeve(config)
+    safe_harbor = resolve_safe_harbor(config)
+    sleeve_scheme = resolve_sleeve_weighting_scheme(config)
+
+    lines: list[str] = []
+
+    if allocator_on:
+        slots = resolve_index_slots(config)
+        index_ma = int(resolve_index_regime_ma(config) or 200)
+        if slots:
+            gated = " | ".join(f"{s.etf} vs {index_ma}D SMA" for s in slots)
+            lines.append(
+                f"  Per-slot trend   : {gated} (applied at BOTH the allocator "
+                f"and each slot's stock picker; legacy global regime bypassed)"
+            )
+        else:
+            lines.append(
+                "  Per-slot trend   : allocator ON but MAD_INDEX_SLOTS empty"
+            )
+    else:
+        if regime_sym is None:
+            return ["  Regime filter    : off (MAD_REGIME_MA_ENABLED=False)"]
+        reg_tickers = resolve_regime_tickers(config)
+        if not reg_tickers:
+            reg_tickers = (regime_sym,)
+        mode = resolve_regime_mode(config)
+        mode_text = "ALL below SMA" if mode == "all_below" else "ANY below SMA"
+        lines.append(
+            f"  Regime filter    : {'+'.join(reg_tickers)} ({mode_text}) | SMA grid {regime_grid} (0 = off)",
+        )
+
+    if sleeve:
+        sleeve_bits: list[str] = []
+        for sym, wt, tma in sleeve:
+            if sleeve_scheme is None:
+                piece = f"{sym} {wt:.0%}"
+            else:
+                piece = sym
+            if int(tma) > 0:
+                piece += f" (trend {tma}D)"
+            sleeve_bits.append(piece)
+        lines.append(
+            f"  Risk-off sleeve  : {', '.join(sleeve_bits)} → safe harbor {safe_harbor or 'cash'}"
+        )
+    else:
+        lines.append(f"  Risk-off sleeve  : full cash (safe harbor {safe_harbor or 'cash'})")
+    if sleeve_scheme is not None:
+        sh, lg = resolve_sleeve_mrat_pair(config)
+        pool = [sym for sym, _w, _ in sleeve]
+        if safe_harbor and safe_harbor not in pool:
+            pool.append(safe_harbor)
+        lines.append(
+            f"  Sleeve weighting : scheme={sleeve_scheme} | pool={'+'.join(pool)} | "
+            f"MRAT {sh}/{lg} (fixed weights in config ignored)"
+        )
+    else:
+        lines.append("  Sleeve weighting : scheme=fixed (uses per-leg weights from MAD_REGIME_OFF_SLEEVE)")
+    return lines
+
+
+def _format_sleeve_desc(pairs: list[tuple[str, float]]) -> str:
+    """Format risk-off sleeve allocation for equity-curve hover.
+
+    ``pairs`` is a list of ``(ticker, weight)`` tuples whose magnitudes sum to at most 1.0.
+    Zero-weight entries are kept so you can see the trend filter dropped a sleeve leg.
+    """
+    if not pairs:
+        return "cash (0%)"
+    bits = [f"{w * 100:.0f}% {sym}" for sym, w in pairs if abs(w) > 1e-9]
+    if not bits:
+        return "cash (sleeve fully dropped by trend filter)"
+    return ", ".join(bits)
+
+
+def _format_equity_sleeve_desc(long_w: float, short_w: float) -> str:
+    """Format risk-on (equities) allocation for equity-curve hover."""
+    if long_w <= 1e-9 and short_w <= 1e-9:
+        return "flat (no MRAT entries)"
+    parts: list[str] = []
+    if long_w > 1e-9:
+        parts.append(f"{long_w * 100:.0f}% MRAT long")
+    if short_w > 1e-9:
+        parts.append(f"{short_w * 100:.0f}% MRAT short")
+    return ", ".join(parts)
+
+
+def _format_weight_config_banner(cfg: WeightConfig) -> str:
+    """One-line human summary of ``MAD_WEIGHTING_*`` — for backtester stdout banner + dashboard."""
+    bits: list[str] = [f"scheme={cfg.scheme}"]
+    if cfg.scheme == "softmax":
+        bits.append(f"τ={cfg.softmax_tau:g}")
+    if cfg.scheme in ("inv_vol", "mrat_distance_inv_vol"):
+        bits.append(f"rvol_n={cfg.realized_vol_lookback}")
+    if cfg.max_per_name is not None:
+        bits.append(f"max={cfg.max_per_name:.2%}")
+    if cfg.min_per_name is not None:
+        bits.append(f"min={cfg.min_per_name:.2%}")
+    if cfg.equal_blend and cfg.equal_blend > 0:
+        bits.append(f"equal_blend={cfg.equal_blend:.0%}")
+    return " | ".join(bits)
 
 
 def _gross_simple_portfolio(w: pd.Series, r: pd.Series) -> float:
@@ -904,41 +1573,137 @@ def portfolio_path_from_panel(
     *,
     fee_rate: float,
     regime_allow: pd.Series | None = None,
+    weight_cfg: WeightConfig | None = None,
+    sleeve_weights_piv: pd.DataFrame | None = None,
+    sleeve_ret_piv: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build date-level gross/net log returns, BH equal-weight universe, turnover fees.
-    Expects columns: date, ticker, entry_signal, daily_ret.
+    Expects columns: date, ticker, entry_signal, daily_ret. For schemes that depend on
+    MRAT / σ / decile (``weight_cfg`` != equal), additional columns ``mrat``, ``sigma``,
+    ``decile`` are required.
 
-    regime_allow: optional Series bool indexed by UTC calendar date (mad_calendar_key).
-    False => zero MRAT weights that day (full cash); True => use MRAT weights.
+    regime_allow: optional bool Series indexed by UTC calendar date (``mad_calendar_key``).
+    False → zero MRAT weights that day. When ``sleeve_weights_piv`` + ``sleeve_ret_piv``
+    are provided, the risk-off book is replaced by the sleeve allocation (and sleeve
+    returns contribute to portfolio equity / turnover) instead of going to cash.
+
+    weight_cfg: ``None`` or ``WeightConfig(scheme="equal", ...)`` uses the legacy equal-weight
+    sizing (preserves current behavior). Any other scheme is dispatched through
+    ``mad.weighting.compute_weights`` per date.
     """
     dates = sorted(df["date"].dropna().unique())
     if len(dates) < 2:
         return pd.DataFrame()
+
+    cfg = weight_cfg or WeightConfig()
+    use_scheme = cfg.scheme != "equal"
 
     entry_piv = df.pivot_table(index="date", columns="ticker", values="entry_signal", aggfunc="last")
     ret_piv = df.pivot_table(index="date", columns="ticker", values="daily_ret", aggfunc="last")
     entry_piv = entry_piv.reindex(dates)
     ret_piv = ret_piv.reindex(dates)
 
+    mrat_piv = decile_piv = rvol_piv = None
+    sigma_per_date: pd.Series | None = None
+    if use_scheme:
+        if {"mrat", "sigma", "decile"}.issubset(df.columns):
+            mrat_piv = df.pivot_table(index="date", columns="ticker", values="mrat", aggfunc="last").reindex(dates)
+            decile_piv = df.pivot_table(index="date", columns="ticker", values="decile", aggfunc="last").reindex(dates)
+            sigma_per_date = df.groupby("date", sort=True)["sigma"].first().reindex(dates)
+            # Same-bar timing: entry_signal[t] already equals signal[t-1]; shift the
+            # weight inputs to match so scheme sizing doesn't peek into date t.
+            mrat_piv = mrat_piv.shift(1)
+            decile_piv = decile_piv.shift(1)
+            sigma_per_date = sigma_per_date.shift(1)
+        if cfg.realized_vol_lookback and cfg.realized_vol_lookback >= 2:
+            rvol_piv = realized_vol_pivot(df, lookback=int(cfg.realized_vol_lookback)).reindex(dates)
+
+    # ck_index maps panel ``dates`` onto UTC-normalized calendar keys so sleeve / regime
+    # pivots (always tz-aware UTC) align even when ``dates`` are naive numpy datetimes.
     ck_index = pd.DatetimeIndex([mad_calendar_key(d) for d in dates], tz="UTC")
+
+    # Sleeve integration: extend the returns pivot with sleeve tickers so their P&L is
+    # reflected on risk-off days. Columns unique to the sleeve start as zero before the
+    # per-date merge; MRAT universe columns keep their original returns.
+    all_cols = pd.Index(ret_piv.columns)
+    if sleeve_weights_piv is not None and not sleeve_weights_piv.empty:
+        new_cols = [c for c in sleeve_weights_piv.columns if c not in all_cols]
+        if new_cols:
+            add = pd.DataFrame(np.nan, index=ret_piv.index, columns=new_cols)
+            ret_piv = pd.concat([ret_piv, add], axis=1)
+            all_cols = pd.Index(ret_piv.columns)
+    if sleeve_ret_piv is not None and not sleeve_ret_piv.empty:
+        slr = sleeve_ret_piv.reindex(ck_index)
+        slr.index = ret_piv.index  # re-label tz-aware → panel index
+        for c in slr.columns:
+            if c not in ret_piv.columns:
+                ret_piv[c] = np.nan
+            ret_piv[c] = ret_piv[c].where(~slr[c].notna(), slr[c])
+        all_cols = pd.Index(ret_piv.columns)
+
     if regime_allow is not None:
         allow_arr = regime_allow.reindex(ck_index, fill_value=False).to_numpy(dtype=bool)
     else:
         allow_arr = np.ones(len(dates), dtype=bool)
+
+    sleeve_arr: np.ndarray | None = None
+    sleeve_cols: list[str] = []
+    if sleeve_weights_piv is not None and not sleeve_weights_piv.empty:
+        sleeve_cols = list(sleeve_weights_piv.columns)
+        sleeve_arr = (
+            sleeve_weights_piv.reindex(ck_index, fill_value=0.0).to_numpy(dtype=float)
+        )
 
     gross_list: list[float] = []
     net_log_list: list[float] = []
     bh_log_list: list[float] = []
     flip_list: list[int] = []
     abs_w_list: list[float] = []
+    regime_state_list: list[str] = []
+    sleeve_desc_list: list[str] = []
     w_prev = pd.Series(0.0, index=ret_piv.columns, dtype=float)
 
     for j, d in enumerate(dates):
         er = entry_piv.loc[d]
-        w = _weights_from_entries(er)
-        if not allow_arr[j]:
-            w = pd.Series(0.0, index=w.index, dtype=float)
+        if use_scheme and mrat_piv is not None and decile_piv is not None:
+            inp = WeightInputs(
+                entry_signal=er,
+                mrat=mrat_piv.loc[d] if d in mrat_piv.index else pd.Series(np.nan, index=er.index),
+                sigma=(
+                    float(sigma_per_date.loc[d])
+                    if (sigma_per_date is not None and d in sigma_per_date.index)
+                    else float("nan")
+                ),
+                decile=decile_piv.loc[d] if d in decile_piv.index else pd.Series(np.nan, index=er.index),
+                realized_vol=(
+                    rvol_piv.loc[d] if rvol_piv is not None and d in rvol_piv.index else None
+                ),
+            )
+            w_core = compute_weights(inp, cfg)
+        else:
+            w_core = _weights_from_entries(er)
+        w = pd.Series(0.0, index=all_cols, dtype=float)
+        w.loc[w_core.index] = w_core.to_numpy()
+        if allow_arr[j]:
+            regime_state_list.append("risk-on")
+            long_w = float(w[w > 0].sum())
+            short_w = float(-w[w < 0].sum())
+            sleeve_desc_list.append(
+                _format_equity_sleeve_desc(long_w, short_w)
+            )
+        else:
+            w = pd.Series(0.0, index=all_cols, dtype=float)
+            sleeve_pairs: list[tuple[str, float]] = []
+            if sleeve_arr is not None and sleeve_cols:
+                sw = sleeve_arr[j]
+                for k, col in enumerate(sleeve_cols):
+                    if col in w.index and sw[k] != 0.0:
+                        w.loc[col] = w.loc[col] + float(sw[k])
+                    if sw[k] != 0.0:
+                        sleeve_pairs.append((col, float(sw[k])))
+            regime_state_list.append("risk-off")
+            sleeve_desc_list.append(_format_sleeve_desc(sleeve_pairs))
         r = ret_piv.loc[d]
         arr = r.to_numpy(dtype=float)
         if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -976,6 +1741,8 @@ def portfolio_path_from_panel(
             "net_log_return": net_log_list,
             "flip": flip_list,
             "abs_weight_sum": abs_w_list,
+            "regime_state": regime_state_list,
+            "sleeve_desc": sleeve_desc_list,
         }
     )
     out = out.set_index("date")
@@ -1142,7 +1909,6 @@ def evaluate_mad(
     long_w: int,
     min_price: float,
     min_history: int,
-    min_names: int,
     fee_rate: float,
     direction_mode: str,
     eval_dates: set | None,
@@ -1159,7 +1925,6 @@ def evaluate_mad(
         long_w=long_w,
         min_price=min_price,
         min_history=min_history,
-        min_names=min_names,
         direction_mode=direction_mode,
         exit_ma_period=exit_ma_period,
     )
@@ -1168,14 +1933,68 @@ def evaluate_mad(
         daily_agg = bool(getattr(config, "MAD_AGGREGATE_TO_DAILY", True)) and gran.lower() != "1d"
     else:
         daily_agg = bool(aggregate_to_daily)
-    regime_allow = _build_regime_allow(
-        int(regime_ma_period or 0),
-        regime_ticker,
-        gran,
-        daily_agg,
-        OHLCV_DIR,
+
+    # Multi-ticker regime + trend-following sleeve (``mad.regime_sleeve``). When a single-ticker
+    # override is supplied, collapse to that ticker so existing grid searches keep their semantics;
+    # otherwise honor ``MAD_REGIME_TICKERS`` + ``MAD_REGIME_OFF_SLEEVE``.
+    reg_tickers_cfg = resolve_regime_tickers(config)
+    reg_mode = resolve_regime_mode(config)
+    sleeve_cfg = resolve_sleeve(config)
+    safe_harbor = resolve_safe_harbor(config)
+    if regime_ticker is not None and str(regime_ticker).strip():
+        reg_tickers_use: tuple[str, ...] = (str(regime_ticker).strip().upper(),)
+    else:
+        reg_tickers_use = reg_tickers_cfg or ((mad_regime_ticker_symbol() or "QQQ"),)
+
+    reg_series: RegimeBacktestSeries | None = None
+    regime_allow: pd.Series | None = None
+    sleeve_weights_piv: pd.DataFrame | None = None
+    sleeve_ret_piv: pd.DataFrame | None = None
+    if int(regime_ma_period or 0) > 0 and reg_tickers_use:
+        try:
+            reg_series = build_regime_backtest_series(
+                ohlcv_dir=OHLCV_DIR,
+                granularity=gran,
+                aggregate_to_daily=daily_agg,
+                regime_tickers=reg_tickers_use,
+                regime_ma=int(regime_ma_period),
+                mode=reg_mode,
+                sleeve=sleeve_cfg,
+                safe_harbor=safe_harbor,
+                prefer_precomputed_sma=False,
+                sleeve_weight_cfg=resolve_sleeve_weight_config(config),
+                sleeve_mrat_pair=resolve_sleeve_mrat_pair(config),
+            )
+        except FileNotFoundError:
+            # Legacy fallback: single-ticker regime with cash sleeve.
+            reg_series = None
+            regime_allow = _build_regime_allow(
+                int(regime_ma_period or 0),
+                reg_tickers_use[0],
+                gran,
+                daily_agg,
+                OHLCV_DIR,
+            )
+        if reg_series is not None:
+            regime_allow = reg_series.risk_on
+            if not reg_series.sleeve_weights_piv.empty:
+                sleeve_weights_piv = reg_series.sleeve_weights_piv
+                sleeve_ret_piv = _load_sleeve_ret_piv(
+                    tuple(reg_series.sleeve_tickers),
+                    gran,
+                    daily_agg=daily_agg,
+                    ohlcv_dir=OHLCV_DIR,
+                )
+
+    weight_cfg = resolve_weight_config(config)
+    path = portfolio_path_from_panel(
+        panel,
+        fee_rate=fee_rate,
+        regime_allow=regime_allow,
+        weight_cfg=weight_cfg,
+        sleeve_weights_piv=sleeve_weights_piv,
+        sleeve_ret_piv=sleeve_ret_piv,
     )
-    path = portfolio_path_from_panel(panel, fee_rate=fee_rate, regime_allow=regime_allow)
     split_by_d = _split_per_date(panel)
     path = path.join(split_by_d.rename("split"), how="left")
 
@@ -1243,6 +2062,494 @@ def evaluate_mad(
     eval_df = path.copy()
     eval_df["next_log_return"] = eval_df["next_log_return"].where(valid, np.nan)
     eval_df["net_log_return"] = eval_df["net_log_return"].where(valid, np.nan)
+    return metrics, eval_df
+
+
+def evaluate_mad_multi_index(
+    daily_long: pd.DataFrame,
+    *,
+    short_w: int,
+    long_w: int,
+    min_price: float,
+    min_history: int,
+    fee_rate: float,
+    direction_mode: str,
+    eval_dates: set | None,
+    bars_per_year_local: float,
+    exit_ma_period: int = 0,
+    granularity: str | None = None,
+    aggregate_to_daily: bool | None = None,
+    _per_slot_cache: dict | None = None,
+    _return_per_slot_cache: bool = False,
+    _verbose: bool = True,
+    sleeve_weight_cfg: WeightConfig | None = None,
+    reuse_cached_sleeve: bool = True,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """Multi-index variant of ``evaluate_mad`` — runs the stock-picker per slot and
+    blends via the top-level index allocator.
+
+    Differences from ``evaluate_mad``:
+      * Stock-picker runs once per ``IndexSlot`` on the slot's exclusive universe.
+      * Legacy single-ticker regime filter is DISABLED per-slot (the allocator's
+        own trend filter on each index ETF takes its place at the top level).
+      * Per-slot daily returns are blended by per-date index weights from
+        ``build_index_allocation_series``; the ``__risk_off__`` share is composed
+        with the standard risk-off sleeve (``regime_sleeve`` module).
+
+    Returns the same ``(metrics, eval_df)`` shape as ``evaluate_mad`` so downstream
+    rendering / dashboard code can consume either transparently.
+
+    ``sleeve_weight_cfg`` overrides ``resolve_sleeve_weight_config(config)`` when
+    building the risk-off sleeve time series (handy for grid searches). When
+    ``_per_slot_cache`` is set, ``reuse_cached_sleeve=False`` forces a fresh
+    ``build_regime_backtest_series`` with the current sleeve scheme — required
+    when sweeping ``MAD_SLEEVE_WEIGHTING_SCHEME`` while reusing cached per-slot
+    stock returns from the first pass.
+    """
+    if daily_long.empty:
+        raise RuntimeError("evaluate_mad_multi_index: empty daily_long panel.")
+
+    gran = str(granularity or config.TARGET_CANDLE_GRANULARITY)
+    if aggregate_to_daily is None:
+        daily_agg = bool(getattr(config, "MAD_AGGREGATE_TO_DAILY", True)) and gran.lower() != "1d"
+    else:
+        daily_agg = bool(aggregate_to_daily)
+
+    slots = resolve_index_slots(config)
+    if not slots:
+        raise RuntimeError(
+            "evaluate_mad_multi_index: MAD_INDEX_SLOTS empty — cannot run multi-index backtest."
+        )
+
+    # 1. Top-level allocation series (per-date index weights + risk-off share).
+    allocation = build_index_allocation_series(
+        slots=slots,
+        regime_ma=resolve_index_regime_ma(config),
+        mrat_pair=resolve_index_mrat_pair(config),
+        weight_cfg=resolve_index_weight_config(config),
+        granularity=gran,
+        ohlcv_dir=OHLCV_DIR,
+        aggregate_to_daily=daily_agg,
+        prefer_precomputed_sma=False,
+    )
+    if allocation.index_weights_piv.empty:
+        raise RuntimeError("evaluate_mad_multi_index: allocation series empty.")
+
+    # Clip the allocator calendar to the user-configured eval window
+    # (``MAD_BACKTEST_START_DATE`` / ``MAD_BACKTEST_END_DATE``). Data is still
+    # loaded for the full range upstream so SMAs / MRATs have proper warmup,
+    # but everything downstream (``cal``, ``eval_df``, B&H benchmark, per-slot
+    # metrics) is restricted to the window — so the dashboard doesn't show a
+    # long flat stretch while B&H captures an unfair head start.
+    bt_start, bt_end = resolve_backtest_window()
+    if bt_start is not None or bt_end is not None:
+        full_cal = allocation.index_weights_piv.index
+        win_mask = pd.Series(True, index=full_cal, dtype=bool)
+        if bt_start is not None:
+            win_mask &= full_cal >= bt_start
+        if bt_end is not None:
+            win_mask &= full_cal <= bt_end
+        if not bool(win_mask.any()):
+            raise RuntimeError(
+                f"MAD_BACKTEST_START_DATE/END_DATE window "
+                f"[{bt_start.date() if bt_start is not None else '-inf'} .. "
+                f"{bt_end.date() if bt_end is not None else '+inf'}] "
+                f"excludes all allocator dates ({full_cal.min().date()} → "
+                f"{full_cal.max().date()})."
+            )
+        clip = win_mask.to_numpy()
+        allocation = dc_replace(
+            allocation,
+            index_weights_piv=allocation.index_weights_piv.loc[clip],
+            index_trend_ok=allocation.index_trend_ok.loc[clip],
+            index_mrat=allocation.index_mrat.loc[clip],
+        )
+        clipped_cal = allocation.index_weights_piv.index
+        print(
+            f"  [eval window] trimmed allocator calendar: "
+            f"{full_cal.min().date()} → {full_cal.max().date()} "
+            f"({len(full_cal)} days) --> "
+            f"{clipped_cal.min().date()} → {clipped_cal.max().date()} "
+            f"({len(clipped_cal)} days)  "
+            f"[config: MAD_BACKTEST_START_DATE="
+            f"{getattr(config, 'MAD_BACKTEST_START_DATE', None)!r}, "
+            f"MAD_BACKTEST_END_DATE="
+            f"{getattr(config, 'MAD_BACKTEST_END_DATE', None)!r}]"
+        )
+        # Also constrain the per-slot eval_dates so standalone slot metrics
+        # match the same window. ``eval_dates`` on evaluate_mad is intersected
+        # with split_by_d internally, but here we override it fully since
+        # multi-index runs bypass the walkforward split logic.
+        window_eval_dates = {mad_calendar_key(d) for d in clipped_cal}
+        eval_dates = (
+            window_eval_dates
+            if eval_dates is None
+            else (eval_dates & window_eval_dates)
+        )
+
+    # 2. Per-slot stock-picker. Store per-slot net-simple daily return on a calendar key.
+    #
+    # GRID-SEARCH CACHE: when ``_per_slot_cache`` is supplied, skip the expensive
+    # stock-picking + risk-off sleeve loading entirely. The per-slot picks depend
+    # only on ``MAD_WEIGHTING_SCHEME`` (stock-level), not the index-level scheme,
+    # so caching is safe across index-level reruns within a single stock scheme.
+    completeness_frac = resolve_min_data_completeness(config)
+    per_slot_returns: dict[str, pd.Series] = {}
+    per_slot_metrics: dict[str, dict[str, float]] = {}
+    per_slot_eval_df: dict[str, pd.DataFrame] = {}
+    per_slot_status: dict[str, str] = {}
+    _use_cache = _per_slot_cache is not None
+    if _use_cache:
+        per_slot_returns = dict(_per_slot_cache["per_slot_returns"])
+        per_slot_metrics = dict(_per_slot_cache["per_slot_metrics"])
+        per_slot_status = dict(_per_slot_cache["per_slot_status"])
+        if _verbose:
+            print("  [per-slot cache hit] reusing stock-picker + sleeve returns")
+
+    for slot in slots:
+        if _use_cache:
+            break
+        if not slot.universe:
+            per_slot_returns[slot.etf] = pd.Series(0.0, dtype=float)
+            per_slot_status[slot.etf] = "empty_universe"
+            print(f"  [{slot.etf}] SKIP: exclusive universe is empty (after priority assignment).")
+            continue
+        slot_df_raw = daily_long[daily_long["ticker"].isin(slot.universe)].copy()
+        pre_n = int(slot_df_raw["ticker"].nunique()) if not slot_df_raw.empty else 0
+        if completeness_frac > 0.0:
+            slot_df, dropped = filter_universe_by_data_completeness(
+                slot_df_raw,
+                window_days=int(long_w),
+                min_completeness=completeness_frac,
+            )
+            if dropped:
+                print(
+                    f"  [{slot.etf}] dropped {len(dropped)} low-completeness tickers "
+                    f"(window={long_w}d, thresh={completeness_frac:.0%})"
+                )
+        else:
+            slot_df = slot_df_raw
+        post_n = int(slot_df["ticker"].nunique()) if not slot_df.empty else 0
+        if slot_df.empty:
+            per_slot_returns[slot.etf] = pd.Series(0.0, dtype=float)
+            per_slot_status[slot.etf] = "empty_after_filter"
+            print(
+                f"  [{slot.etf}] SKIP: 0 tickers survived the data-completeness filter "
+                f"(configured universe size={len(slot.universe)}, panel had {pre_n} with rows)."
+            )
+            continue
+        slot_regime_ma = int(resolve_index_regime_ma(config) or 0)
+        print(
+            f"  [{slot.etf}] running stock-picker on {post_n} tickers "
+            f"(configured={len(slot.universe)}, present-in-panel={pre_n}, "
+            f"regime gate: {slot.etf} vs {slot_regime_ma}D SMA)..."
+        )
+        metrics_s, eval_df_s = evaluate_mad(
+            slot_df,
+            short_w=int(short_w),
+            long_w=int(long_w),
+            min_price=float(min_price),
+            min_history=int(min_history),
+            fee_rate=float(fee_rate),
+            direction_mode=str(direction_mode),
+            eval_dates=eval_dates,
+            bars_per_year_local=float(bars_per_year_local),
+            exit_ma_period=int(exit_ma_period or 0),
+            # Per-slot regime gate: the picker rotates into the standard
+            # risk-off sleeve (``MAD_REGIME_OFF_SLEEVE``) whenever the slot's
+            # own ETF is below its ``MAD_INDEX_REGIME_MA`` SMA. This is
+            # *duplicative* of the top-level allocator trend filter on the
+            # same ETF (same MA), but it makes the **standalone** per-slot
+            # return in the summary reflect real regime-aware trading.
+            # On blended dates where the allocator gives the slot non-zero
+            # weight the ETF is by construction above trend, so the slot's
+            # regime gate is passing too — no double-rotation drag.
+            regime_ma_period=slot_regime_ma,
+            regime_ticker=slot.etf,
+            granularity=gran,
+            aggregate_to_daily=daily_agg,
+        )
+        per_slot_metrics[slot.etf] = metrics_s
+        per_slot_eval_df[slot.etf] = eval_df_s
+        ret_series = eval_df_s["net_log_return"].dropna()
+        per_slot_returns[slot.etf] = np.expm1(ret_series)  # simple return
+        # Additional diagnostic: "days with position" is in metrics if evaluate_mad fills it.
+        days_pos = metrics_s.get("days_with_position", None)
+        bars = int(metrics_s.get("bars", 0))
+        ntr = float(metrics_s.get("net_total_return", 0.0))
+        if bars == 0 or (ret_series.abs().sum() == 0.0):
+            per_slot_status[slot.etf] = "no_trades"
+            print(
+                f"  [{slot.etf}] WARNING: stock-picker returned a flat book "
+                f"(bars={bars}, |returns|=0). Likely: no eval dates overlap the slot's data, "
+                f"or no tickers ever hit the long decile in the eval window."
+            )
+        else:
+            per_slot_status[slot.etf] = "ok"
+            dp_txt = f", days_with_position={int(days_pos)}" if days_pos is not None else ""
+            print(
+                f"  [{slot.etf}] done: net_total_return={ntr:+.2%}, bars={bars}{dp_txt}"
+            )
+
+    # 3. Risk-off sleeve returns — reuse regime_sleeve with existing config (we need
+    #    sleeve weights per date; top-level regime flag is ignored here since the
+    #    allocator's own risk_off_share dictates when the sleeve is active).
+    sw_cfg = (
+        sleeve_weight_cfg
+        if sleeve_weight_cfg is not None
+        else resolve_sleeve_weight_config(config)
+    )
+    sleeve_weights_piv: pd.DataFrame | None = None
+    sleeve_ret_piv: pd.DataFrame | None = None
+    _load_sleeve_from_cache = (
+        _use_cache
+        and reuse_cached_sleeve
+        and _per_slot_cache.get("sleeve_weights_piv") is not None
+    )
+    if _load_sleeve_from_cache:
+        sleeve_weights_piv = _per_slot_cache["sleeve_weights_piv"]
+        sleeve_ret_piv = _per_slot_cache["sleeve_ret_piv"]
+    else:
+        try:
+            reg_series = build_regime_backtest_series(
+                ohlcv_dir=OHLCV_DIR,
+                granularity=gran,
+                aggregate_to_daily=daily_agg,
+                regime_tickers=resolve_regime_tickers(config) or (slots[0].etf,),
+                regime_ma=max(1, int(resolve_regime_ma(config) or 200)),
+                mode=resolve_regime_mode(config),
+                sleeve=resolve_sleeve(config),
+                safe_harbor=resolve_safe_harbor(config),
+                prefer_precomputed_sma=False,
+                sleeve_weight_cfg=sw_cfg,
+                sleeve_mrat_pair=resolve_sleeve_mrat_pair(config),
+            )
+        except FileNotFoundError:
+            reg_series = None
+        if reg_series is not None and not reg_series.sleeve_weights_piv.empty:
+            sleeve_weights_piv = reg_series.sleeve_weights_piv
+            sleeve_ret_piv = _load_sleeve_ret_piv(
+                tuple(reg_series.sleeve_tickers),
+                gran,
+                daily_agg=daily_agg,
+                ohlcv_dir=OHLCV_DIR,
+            )
+
+    # 4. Blend per-date. Align every series to the allocation calendar.
+    cal = allocation.index_weights_piv.index
+    blended_simple = pd.Series(0.0, index=cal, dtype=float)
+    for etf, ret in per_slot_returns.items():
+        if ret.empty:
+            continue
+        ret_u = ret.copy()
+        ret_u.index = pd.DatetimeIndex(ret_u.index, tz="UTC").normalize()
+        ret_u = ret_u.groupby(level=0).last().reindex(cal).fillna(0.0)
+        w_col = allocation.index_weights_piv[etf].reindex(cal).fillna(0.0)
+        blended_simple = blended_simple.add(ret_u * w_col, fill_value=0.0)
+
+    risk_off_ret = pd.Series(0.0, index=cal, dtype=float)
+    if sleeve_weights_piv is not None and sleeve_ret_piv is not None and not sleeve_ret_piv.empty:
+        sw = sleeve_weights_piv.reindex(cal).fillna(0.0)
+        sr = sleeve_ret_piv.reindex(cal).fillna(0.0)
+        common = sw.columns.intersection(sr.columns)
+        if len(common) > 0:
+            risk_off_ret = (sw[common] * sr[common]).sum(axis=1).fillna(0.0)
+    w_ro = allocation.index_weights_piv[RISK_OFF_KEY].reindex(cal).fillna(0.0)
+    blended_simple = blended_simple.add(risk_off_ret * w_ro, fill_value=0.0)
+
+    # 5. Translate to the eval_df shape expected by the dashboard.
+    net_log = np.log1p(blended_simple.clip(lower=-0.999999))
+
+    # Buy-and-hold benchmark. Previously this was (incorrectly) set to the
+    # strategy's own ``net_log_return.shift(-1)``, which made the dashboard
+    # compare the strategy to a 1-bar-shifted copy of itself (vol, drawdown,
+    # Sharpe all matched "buy & hold" by construction). We reconstruct it from
+    # the panel's close series.
+    #
+    # We prefer SPY as the B&H benchmark whenever it's one of the configured
+    # slots, regardless of slot priority order. Slot order controls exclusive
+    # ticker assignment + panel calendar anchor, but everyone's mental model
+    # of "buy & hold" is SPY — not IWM or QQQ — so the dashboard comparison
+    # should stay stable when we re-order ``MAD_INDEX_SLOTS``. Fallback chain:
+    # SPY → first slot ETF.
+    slot_etfs = {s.etf for s in slots}
+    ref_etf = "SPY" if "SPY" in slot_etfs else slots[0].etf
+    ref_bars = daily_long[daily_long["ticker"] == ref_etf]
+    if ref_bars.empty:
+        next_log = pd.Series(np.nan, index=cal, dtype=float)
+    else:
+        ref_close = (
+            ref_bars.sort_values("date")
+            .drop_duplicates(subset=["date"], keep="last")
+            .set_index("date")["close"]
+            .astype(float)
+        )
+        # Normalize index tz to match ``cal`` (``allocation.index_weights_piv.index``).
+        ref_close.index = pd.DatetimeIndex(ref_close.index, tz="UTC").normalize()
+        ref_close = ref_close.groupby(level=0).last().sort_index()
+        ref_log_ret = np.log(ref_close / ref_close.shift(1))
+        # ``next_log_return[t]`` is the BH return realized *between today's
+        # close and the next bar's close* — align to the same convention as
+        # the single-universe path.
+        next_log = ref_log_ret.shift(-1).reindex(cal)
+
+    # Rebalance / trade counts for the top-level allocator: count days where
+    # the index weight vector (SPY/QQQ/IWM/risk-off) actually changed. The
+    # allocator reweights daily in principle, but in practice weights are
+    # piecewise-constant across long stretches (e.g. "all three pass trend,
+    # equal weights" holds for weeks at a time), so this gives a meaningful
+    # turnover signal instead of the previous hardcoded ``0``.
+    w_diff = allocation.index_weights_piv.diff().abs().sum(axis=1)
+    # First row has NaN diff → treat as an initial rebalance only if any weight
+    # is non-zero on the first day.
+    first_nonzero = bool(float(allocation.index_weights_piv.iloc[0].abs().sum()) > 1e-12)
+    rebalance_mask = (w_diff > 1e-9).fillna(first_nonzero)
+    rebalance_days_total = int(rebalance_mask.sum())
+
+    eval_df = pd.DataFrame(
+        {
+            "net_log_return": net_log,
+            "gross_simple": blended_simple,  # no separate gross/net split at top level
+            "abs_weight_sum": 1.0,           # always fully invested (equity + risk-off sum to 1)
+            "flip": rebalance_mask.reindex(cal).fillna(False).astype(bool),
+            "next_log_return": next_log,
+        },
+        index=cal,
+    )
+
+    # Stash allocator diagnostics on the frame for dashboard hover.
+    for col in allocation.index_weights_piv.columns:
+        eval_df[f"alloc_{col}"] = allocation.index_weights_piv[col].reindex(cal).fillna(0.0)
+
+    # Also stash per-ETF trend-filter state (True = ETF above its regime MA on
+    # that day, i.e. eligible for equity allocation). Surfaces WHICH slot(s)
+    # caused the allocator to rotate into risk-off, year-over-year. Missing
+    # values (ETF not in trend panel) are treated as False so the diagnostic
+    # reads as "not passing".
+    try:
+        for etf in allocation.index_trend_ok.columns:
+            eval_df[f"trend_ok_{etf}"] = (
+                allocation.index_trend_ok[etf].reindex(cal).fillna(False).astype(bool)
+            )
+    except Exception:  # noqa: BLE001
+        # Defensive: if ``index_trend_ok`` is unexpectedly missing or misshaped,
+        # skip silently so the main strategy output still renders.
+        pass
+
+    # Sleeve description per date (4-way split for hover): per-index weights,
+    # plus — on risk-off days — a nested breakdown of the sleeve's internal
+    # composition (e.g. GLD / TLT / BIL legs produced by ``regime_sleeve``).
+    def _fmt_sleeve_inner(dt: pd.Timestamp) -> str:
+        if sleeve_weights_piv is None or sleeve_weights_piv.empty:
+            return ""
+        if dt not in sleeve_weights_piv.index:
+            return ""
+        row = sleeve_weights_piv.loc[dt]
+        parts = [
+            f"{int(round(float(v) * 100))}% {sym}"
+            for sym, v in row.items()
+            if pd.notna(v) and float(v) >= 0.005
+        ]
+        return " + ".join(parts) if parts else ""
+
+    def _fmt_alloc_row(dt: pd.Timestamp) -> str:
+        row = allocation.index_weights_piv.loc[dt]
+        parts: list[str] = []
+        for col in allocation.index_weights_piv.columns:
+            v = float(row.get(col, 0.0))
+            if v >= 0.001:
+                if col == RISK_OFF_KEY:
+                    inner = _fmt_sleeve_inner(dt)
+                    label = f"risk-off [{inner}]" if inner else "risk-off"
+                else:
+                    label = col
+                parts.append(f"{int(round(v * 100))}% {label}")
+        return " / ".join(parts) if parts else "0%"
+
+    eval_df["sleeve_desc"] = [_fmt_alloc_row(d) for d in cal]
+    eval_df["regime_state"] = np.where(
+        allocation.index_weights_piv[RISK_OFF_KEY].reindex(cal).fillna(1.0) >= 0.999,
+        "risk-off (all indexes failed trend)",
+        np.where(
+            allocation.index_weights_piv[RISK_OFF_KEY].reindex(cal).fillna(0.0) <= 0.001,
+            "risk-on (all indexes passed trend)",
+            "mixed (progressive risk-off blend)",
+        ),
+    )
+
+    # Mask eval_dates if caller restricted.
+    if eval_dates is None:
+        mask_ser = pd.Series(True, index=eval_df.index, dtype=bool)
+    else:
+        ed = {mad_calendar_key(x) for x in eval_dates}
+        mask_ser = pd.Series([mad_calendar_key(ix) in ed for ix in eval_df.index], index=eval_df.index, dtype=bool)
+    valid = eval_df["net_log_return"].notna() & eval_df["next_log_return"].notna() & mask_ser
+    vals = eval_df.loc[valid, "net_log_return"].to_numpy(dtype=float)
+    gross_simple_arr = eval_df.loc[valid, "gross_simple"].to_numpy(dtype=float)
+    gross_log = np.log1p(gross_simple_arr[np.isfinite(gross_simple_arr) & (gross_simple_arr > -1.0)])
+
+    metrics = {
+        "mad_sma_short": int(short_w),
+        "mad_sma_long": int(long_w),
+        "mad_exit_ma": int(exit_ma_period or 0),
+        "mad_regime_ma": int(resolve_index_regime_ma(config)),
+        "mad_regime_ticker": "[multi-index]",
+        "mad_index_allocator": 1,
+        "mad_sleeve_weighting_scheme": str(sw_cfg.scheme) if sw_cfg is not None else "fixed",
+        "bars": int(valid.sum()),
+        # ``trades`` / ``rebalance_days`` = # calendar days where the top-level
+        # index-allocator vector actually changed (SPY/QQQ/IWM/risk-off). This
+        # excludes static holding stretches (e.g. "all 3 pass trend, equal
+        # weights" may hold for weeks).
+        "trades": rebalance_days_total,
+        "rebalance_days": rebalance_days_total,
+        "days_with_position": int(valid.sum()),
+        "profit_factor": float(_pf(vals)),
+        "sharpe_ratio": float(_sharpe(vals, bars_per_year_local)),
+        "sortino_ratio": float(_sortino(vals, bars_per_year_local)),
+        "gross_total_log_return": float(np.sum(gross_log)) if len(gross_log) else 0.0,
+        "net_total_log_return": float(np.sum(vals)) if len(vals) else 0.0,
+        "net_total_return": float(np.expm1(np.sum(vals))) if len(vals) else 0.0,
+    }
+    # Surface per-slot contributions + status so main() can render a line for
+    # every configured slot (including ones that short-circuited / had no trades).
+    for etf, m_slot in per_slot_metrics.items():
+        metrics[f"slot_{etf}_net_total_return"] = float(m_slot.get("net_total_return", float("nan")))
+        metrics[f"slot_{etf}_sharpe"] = float(m_slot.get("sharpe_ratio", float("nan")))
+        metrics[f"slot_{etf}_bars"] = float(m_slot.get("bars", 0))
+    for etf, status in per_slot_status.items():
+        metrics[f"slot_{etf}_status"] = status  # type: ignore[assignment]
+
+    # Propagate split id for dashboard split-column support (reuse panel's inferred split).
+    try:
+        panel_for_splits = compute_mrat_panel(
+            daily_long,
+            short_w=int(short_w),
+            long_w=int(long_w),
+            min_price=float(min_price),
+            min_history=int(min_history),
+            direction_mode=str(direction_mode),
+            exit_ma_period=int(exit_ma_period or 0),
+        )
+        split_by_d = _split_per_date(panel_for_splits)
+        eval_df = eval_df.join(split_by_d.rename("split"), how="left")
+    except Exception:
+        eval_df["split"] = np.nan
+
+    eval_df["next_log_return"] = eval_df["next_log_return"].where(valid, np.nan)
+    eval_df["net_log_return"] = eval_df["net_log_return"].where(valid, np.nan)
+
+    # Optionally hand back the per-slot cache so callers running a grid search
+    # over index-level schemes can reuse the expensive stock-picking step.
+    if _return_per_slot_cache:
+        metrics["_per_slot_cache"] = {
+            "per_slot_returns": per_slot_returns,
+            "per_slot_metrics": per_slot_metrics,
+            "per_slot_status": per_slot_status,
+            "sleeve_weights_piv": sleeve_weights_piv,
+            "sleeve_ret_piv": sleeve_ret_piv,
+        }
+
     return metrics, eval_df
 
 
@@ -1384,6 +2691,7 @@ def build_app(
     universe_n: int,
     *,
     combined_only: bool = False,
+    weight_banner: str | None = None,
 ) -> Dash:
     real_splits = sorted(s for s in results if s != AVG_KEY)
     if combined_only or not real_splits:
@@ -1444,7 +2752,8 @@ def build_app(
                 style={"textAlign": "center", "marginBottom": "4px"},
             ),
             html.P(
-                "Cross-sectional MRAT deciles + σ thresholds | Equal-weight portfolio",
+                "Cross-sectional MRAT deciles + σ thresholds | "
+                f"Weighting: {weight_banner or 'scheme=equal'}",
                 style={"textAlign": "center", "color": "#aaa", "marginTop": 0},
             ),
             html.Div(
@@ -1522,8 +2831,9 @@ def build_app(
             reg_part = f" | regime SMA={reg}"
         else:
             reg_part = " | regime off"
+        w_part = f" | weighting {weight_banner}" if weight_banner else ""
         subtitle = (
-            f"{label} | MRAT SMA {sh}/{lo} |{ex_part}{reg_part} | "
+            f"{label} | MRAT SMA {sh}/{lo} |{ex_part}{reg_part}{w_part} | "
             f"PF={float(metrics['profit_factor']):.4f} | Sharpe={float(metrics['sharpe_ratio']):.4f} | "
             f"Sortino={float(metrics['sortino_ratio']):.4f} | Rebal days={rb} | Days in mkt={dpos}"
         )
@@ -1543,7 +2853,46 @@ def main() -> None:
     parser.add_argument("--fee-rate", type=float, default=float(getattr(config, "BACKTEST_FEE_RATE", 0.001)))
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--no-dashboard", action="store_true")
+    parser.add_argument(
+        "--single-index",
+        choices=("sp500", "nasdaq100", "russell2000"),
+        default=None,
+        help=(
+            "Temporarily run in single-universe mode for one index (disables the "
+            "multi-index allocator for this run only). "
+            "sp500 → (SPY, MAD_UNIVERSE=sp500), "
+            "nasdaq100 → (QQQ, MAD_UNIVERSE=nasdaq100), "
+            "russell2000 → (IWM, MAD_UNIVERSE=russell2000). "
+            "Uses the matching ETF as regime ticker."
+        ),
+    )
     args = parser.parse_args()
+
+    # --single-index: override the allocator + universe for this run only so
+    # we can sanity-check each index in isolation against the old single-
+    # universe path. Mutates the imported ``config`` module attributes in
+    # memory (process-local); does not touch config.py on disk.
+    if args.single_index is not None:
+        from deepvibe_hedge.sp500 import sp500 as _sp500
+        from deepvibe_hedge.nasdaq100 import nasdaq100 as _nasdaq100
+        from deepvibe_hedge.russell2000 import russell2000 as _russell2000
+
+        _SINGLE_INDEX_MAP = {
+            "sp500":      ("SPY", _sp500,      "S&P 500"),
+            "nasdaq100":  ("QQQ", _nasdaq100,  "NASDAQ-100"),
+            "russell2000":("IWM", _russell2000,"Russell 2000"),
+        }
+        etf, universe_tuple, label = _SINGLE_INDEX_MAP[args.single_index]
+        config.MAD_INDEX_ALLOCATOR_ENABLED = False          # turn off the top-level allocator
+        config.MAD_UNIVERSE_TICKERS = tuple(universe_tuple)  # stock picker universe
+        config.MAD_REGIME_TICKER = etf                       # regime gate = this index's ETF
+        config.MAD_REGIME_TICKERS = (etf,)                   # multi-ticker regime collapses to this ETF
+        config.MAD_REGIME_MA_ENABLED = True                  # ensure gate is on
+        print(
+            f"\n[--single-index] override active: {label} "
+            f"(universe={len(universe_tuple)} tickers, regime={etf} vs "
+            f"{int(getattr(config, 'MAD_REGIME_MA', 200))}D SMA, allocator DISABLED)\n"
+        )
 
     ref = mad_reference_ticker()
     universe = mad_universe_tickers()
@@ -1574,8 +2923,6 @@ def main() -> None:
     direction = getattr(config, "MAD_DIRECTION_MODE", "both")
     min_price = float(MAD_DEFAULT_MIN_PRICE)
     min_hist = int(getattr(config, "MAD_MIN_HISTORY_BARS", 252))
-    min_names_cfg = int(MAD_DEFAULT_MIN_NAMES_PER_DATE)
-    min_names = effective_min_names_per_date(daily_long, min_names_cfg)
     grid = _param_grid()
     exit_grid = _exit_ma_grid()
     exit_ma_enabled = bool(getattr(config, "MAD_EXIT_MA_ENABLED", True))
@@ -1583,6 +2930,32 @@ def main() -> None:
     regime_sym = mad_regime_ticker_symbol()
     eval_all = bool(getattr(config, "MAD_EVAL_ALL_SPLITS", False))
     all_research_dates = {mad_calendar_key(d) for d in split_by_d[split_by_d > 0].index}
+
+    # Honor the user-configured eval window in the single-universe path too
+    # (grid search + walkforward + final eval all flow through
+    # ``all_research_dates``). We simply intersect with the window set; this
+    # leaves the full-panel fast path alone when both bounds are unset.
+    _bt_start_cfg, _bt_end_cfg = resolve_backtest_window()
+    if _bt_start_cfg is not None or _bt_end_cfg is not None:
+        window_keys = _eval_dates_from_window(
+            [mad_calendar_key(d) for d in split_by_d.index],
+            _bt_start_cfg,
+            _bt_end_cfg,
+        )
+        if window_keys is not None:
+            before = len(all_research_dates)
+            all_research_dates = all_research_dates & window_keys
+            print(
+                f"  [eval window] restricted non-warmup research days: "
+                f"{before:,} → {len(all_research_dates):,}  "
+                f"(MAD_BACKTEST_START_DATE={getattr(config, 'MAD_BACKTEST_START_DATE', None)!r}, "
+                f"MAD_BACKTEST_END_DATE={getattr(config, 'MAD_BACKTEST_END_DATE', None)!r})"
+            )
+            if not all_research_dates:
+                raise RuntimeError(
+                    "MAD_BACKTEST_START_DATE / END_DATE window excludes all "
+                    "non-warmup research days. Widen the window or reduce MAD_IS/OOS splits."
+                )
 
     if any(int(x) > 0 for x in regime_grid):
         if not regime_sym:
@@ -1592,6 +2965,21 @@ def main() -> None:
             )
         _load_regime_daily_close(regime_sym, gran, OHLCV_DIR, aggregate_to_daily=daily_agg)
 
+    wcfg = resolve_weight_config(config)
+    regime_lines = "\n".join(_format_regime_sleeve_banner(regime_sym, regime_grid))
+    index_alloc_lines = "\n".join(format_index_allocation_banner(config))
+    bt_start_cfg, bt_end_cfg = resolve_backtest_window()
+    if bt_start_cfg is None and bt_end_cfg is None:
+        eval_window_line = (
+            "  Eval window      : full panel (no MAD_BACKTEST_START_DATE / END_DATE set)"
+        )
+    else:
+        eval_window_line = (
+            f"  Eval window      : "
+            f"{bt_start_cfg.date() if bt_start_cfg is not None else '-inf'} → "
+            f"{bt_end_cfg.date() if bt_end_cfg is not None else '+inf'}  "
+            f"(SMAs still warm up on full data; dashboard + metrics start at window)"
+        )
     print(
         f"\nMAD / MRAT panel backtest\n"
         f"  Reference ticker : {ref}\n"
@@ -1603,31 +2991,460 @@ def main() -> None:
         f"  MRAT grid        : {len(grid)} pair(s) {grid[:5]}{'...' if len(grid) > 5 else ''}\n"
         f"  Exit MA          : "
         f"{'disabled (MAD_EXIT_MA_ENABLED=False)' if not exit_ma_enabled else f'grid {exit_grid} (0 = off; close > SMA to hold long)'}\n"
-        f"  Regime (cash)    : "
-        f"{'off' if regime_sym is None else f'{regime_sym} grid {regime_grid} (0 = off; ETF below SMA ⇒ full cash)'}\n"
+        f"{regime_lines}\n"
+        f"{eval_window_line}\n"
+        f"  Weighting scheme : {_format_weight_config_banner(wcfg)}\n"
         f"  Direction mode   : {direction}\n"
         f"  Long / short decile: ≥{getattr(config, 'MAD_LONG_DECILE_MIN', 10)} / ≤{getattr(config, 'MAD_SHORT_DECILE_MAX', 1)}\n"
         f"  Symmetric short σ: {getattr(config, 'MAD_SYMMETRIC_SHORT_SIGMA', False)} "
         f"(short k = long k when True; else MAD_SHORT_SIGMA_MULT)\n"
         f"  Fee rate         : {args.fee_rate:.4%}\n"
-        f"  Min names / date : {min_names} (default={min_names_cfg}, universe n={n_univ})\n"
         f"  Min history bars : {min_hist} (daily bars after aggregation; IPOs join when warm)\n"
+        f"{index_alloc_lines}\n"
     )
-    cap0 = min(min_names_cfg, n_univ)
-    if min_names < cap0:
-        print(
-            f"  Note: σ/deciles need ≥{min_names} names per day (default {min_names_cfg}, "
-            f"universe n={n_univ}, cap {cap0}; default universe slack relaxes a full-{n_univ} "
-            f"requirement so sparse sessions still rank).\n"
-        )
-    elif min_names_cfg > n_univ:
-        print(
-            f"  Note: default min names/date {min_names_cfg} > n={n_univ}; effective min names = {min_names}.\n"
-        )
     if eval_all:
         print(
             f"  All-splits eval    : {len(all_research_dates):,} calendar days (split > 0, excl. warmup)\n"
         )
+
+    # ----- Multi-index allocator dispatch --------------------------------------
+    # Cartesian grid over three axes (stock / index allocator / hedge sleeve),
+    # each optional. Legacy bools OR into the axis flags (see config section 5).
+    if index_allocator_enabled(config):
+        short_w_cfg = int(getattr(config, "MAD_SMA_SHORT", 21))
+        long_w_cfg = int(getattr(config, "MAD_SMA_LONG", 200))
+        exit_w_cfg = int(getattr(config, "MAD_EXIT_MA_PERIOD", 0) or 0)
+
+        _all_schemes = (
+            "equal",
+            "mrat_distance",
+            "mrat_zscore",
+            "softmax",
+            "rank",
+            "inv_vol",
+            "mrat_distance_inv_vol",
+        )
+
+        gs = bool(getattr(config, "MAD_GRID_SEARCH_STOCK", False))
+        gi = bool(getattr(config, "MAD_GRID_SEARCH_INDEX", False))
+        gsv = bool(getattr(config, "MAD_GRID_SEARCH_SLEEVE", False))
+        if bool(getattr(config, "MAD_STOCK_WEIGHTING_GRID_SEARCH", False)):
+            gs = True
+        if bool(getattr(config, "MAD_SLEEVE_WEIGHTING_GRID_SEARCH", False)):
+            gsv = True
+        if bool(getattr(config, "MAD_INDEX_WEIGHTING_GRID_SEARCH", False)):
+            gs = True
+            gi = True
+
+        grid_any = gs or gi or gsv
+
+        if grid_any:
+            if gs:
+                stock_list = tuple(
+                    getattr(config, "MAD_STOCK_WEIGHTING_GRID", None)
+                    or getattr(config, "MAD_WEIGHTING_GRID", None)
+                    or _all_schemes
+                )
+            else:
+                stock_list = (str(getattr(config, "MAD_WEIGHTING_SCHEME", "equal")),)
+
+            if gi:
+                index_list = tuple(
+                    getattr(config, "MAD_INDEX_WEIGHTING_GRID", None) or _all_schemes
+                )
+            else:
+                _idx = getattr(config, "MAD_INDEX_WEIGHTING_SCHEME", None)
+                index_list = (_idx if _idx is not None else "equal",)
+
+            if gsv:
+                sleeve_list = tuple(
+                    getattr(config, "MAD_SLEEVE_WEIGHTING_GRID", None) or _all_schemes
+                )
+            else:
+                sleeve_list = (getattr(config, "MAD_SLEEVE_WEIGHTING_SCHEME", None),)
+
+            combos = list(itertools.product(stock_list, index_list, sleeve_list))
+            ncomb = len(combos)
+            optim_metric = str(
+                getattr(config, "MAD_GRID_OPTIMIZE_METRIC", None)
+                or getattr(config, "MAD_INDEX_OPTIMIZE_METRIC", "sharpe_ratio")
+            )
+
+            ax_txt = (
+                f"stock={'ON' if gs else 'fixed'} | "
+                f"index={'ON' if gi else 'fixed'} | "
+                f"sleeve={'ON' if gsv else 'fixed'}"
+            )
+            print(
+                f"\n[Multi-index weighting grid] {ncomb} combo(s)  ({ax_txt})\n"
+                f"  objective = MAX {optim_metric}\n"
+                f"  Axes: {len(stock_list)} × {len(index_list)} × {len(sleeve_list)} — "
+                f"full 7×7×7 = 343 when all three are ON.\n"
+                f"  Per-stock scheme: first pass builds per-slot cache; later combos reuse it "
+                f"(sleeve rebuilt each time)."
+            )
+
+            original_stock_scheme = getattr(config, "MAD_WEIGHTING_SCHEME", "equal")
+            original_index_scheme = getattr(config, "MAD_INDEX_WEIGHTING_SCHEME", None)
+            original_sleeve_scheme = getattr(config, "MAD_SLEEVE_WEIGHTING_SCHEME", None)
+
+            combo_results: list[dict] = []
+            slot_cache_by_stock: dict[str, dict] = {}
+
+            try:
+                for ci, (stock_scheme, index_scheme, sleeve_scheme) in enumerate(combos):
+                    config.MAD_WEIGHTING_SCHEME = stock_scheme
+                    config.MAD_INDEX_WEIGHTING_SCHEME = index_scheme
+                    config.MAD_SLEEVE_WEIGHTING_SCHEME = sleeve_scheme
+                    sw_try = resolve_sleeve_weight_config(config)
+                    if gsv and sw_try is None:
+                        print(
+                            f"\n  [{ci + 1}/{ncomb}] skip sleeve={sleeve_scheme!r}: "
+                            f"fixed-weight mode (not in dynamic grid)"
+                        )
+                        continue
+
+                    sc = slot_cache_by_stock.get(str(stock_scheme))
+                    is_first_for_stock = sc is None
+                    mode = (
+                        "(full per-slot)"
+                        if is_first_for_stock
+                        else "(cached per-slot + fresh sleeve/allocator)"
+                    )
+                    print(
+                        f"\n  [{ci + 1}/{ncomb}] stock={stock_scheme} | index={index_scheme} | "
+                        f"sleeve={sleeve_scheme}  {mode}"
+                    )
+                    m_try, df_try = evaluate_mad_multi_index(
+                        daily_long,
+                        short_w=short_w_cfg,
+                        long_w=long_w_cfg,
+                        min_price=min_price,
+                        min_history=min_hist,
+                        fee_rate=float(args.fee_rate),
+                        direction_mode=direction,
+                        eval_dates=None,
+                        bars_per_year_local=bpy,
+                        exit_ma_period=exit_w_cfg,
+                        granularity=gran,
+                        aggregate_to_daily=daily_agg,
+                        _per_slot_cache=sc,
+                        _return_per_slot_cache=is_first_for_stock,
+                        # Never reuse stale sleeve rows from cache when (index|sleeve) vary.
+                        reuse_cached_sleeve=(sc is None),
+                        sleeve_weight_cfg=sw_try,
+                        _verbose=is_first_for_stock,
+                    )
+                    if is_first_for_stock:
+                        popped = m_try.pop("_per_slot_cache", None)
+                        if popped is not None:
+                            slot_cache_by_stock[str(stock_scheme)] = popped
+
+                    combo_results.append(
+                        {
+                            "stock_scheme": stock_scheme,
+                            "index_scheme": index_scheme,
+                            "sleeve_scheme": sleeve_scheme,
+                            "metrics": m_try,
+                            "eval_df": df_try,
+                        }
+                    )
+                    print(
+                        f"    → return={m_try['net_total_return']:+7.2%}  "
+                        f"sharpe={m_try['sharpe_ratio']:6.2f}  "
+                        f"sortino={m_try['sortino_ratio']:6.2f}  "
+                        f"pf={m_try['profit_factor']:5.2f}"
+                    )
+            finally:
+                config.MAD_WEIGHTING_SCHEME = original_stock_scheme
+                config.MAD_INDEX_WEIGHTING_SCHEME = original_index_scheme
+                config.MAD_SLEEVE_WEIGHTING_SCHEME = original_sleeve_scheme
+
+            if not combo_results:
+                raise RuntimeError(
+                    "Weighting grid: no valid combos (e.g. every sleeve candidate "
+                    "resolved to fixed-weight None while sleeve axis was ON)."
+                )
+
+            combo_results.sort(
+                key=lambda r: (
+                    float(r["metrics"].get(optim_metric, float("-inf")))
+                    if np.isfinite(r["metrics"].get(optim_metric, float("-inf")))
+                    else float("-inf")
+                ),
+                reverse=True,
+            )
+
+            print(f"\n{'=' * 120}")
+            print(f"  WEIGHTING GRID LEADERBOARD (sorted by MAX {optim_metric})")
+            print(f"{'=' * 120}")
+            print(
+                f"  {'rank':>4} {'stock':<22} {'index':<22} {'sleeve':<22} "
+                f"{'return':>10} {'sharpe':>7} {'sortino':>8} {'PF':>5}"
+            )
+            for r_i, r in enumerate(combo_results, 1):
+                m = r["metrics"]
+                marker = "  ★" if r_i == 1 else "   "
+                print(
+                    f"  {r_i:>4} {str(r['stock_scheme']):<22} {str(r['index_scheme']):<22} "
+                    f"{str(r['sleeve_scheme']):<22} "
+                    f"{m['net_total_return']:>+9.2%} {m['sharpe_ratio']:>7.2f} "
+                    f"{m['sortino_ratio']:>8.2f} {m['profit_factor']:>5.2f}{marker}"
+                )
+            print(f"{'=' * 120}")
+
+            winner = combo_results[0]
+            config.MAD_WEIGHTING_SCHEME = winner["stock_scheme"]
+            config.MAD_INDEX_WEIGHTING_SCHEME = winner["index_scheme"]
+            config.MAD_SLEEVE_WEIGHTING_SCHEME = winner["sleeve_scheme"]
+            metrics_mi = winner["metrics"]
+            eval_df_mi = winner["eval_df"]
+            print(
+                f"\n  Winner (MAX {optim_metric}): "
+                f"stock={winner['stock_scheme']!r} × index={winner['index_scheme']!r} × "
+                f"sleeve={winner['sleeve_scheme']!r} "
+                f"→ return={metrics_mi['net_total_return']:+.2%}, "
+                f"sharpe={metrics_mi['sharpe_ratio']:.2f}"
+            )
+            print(
+                "  Dashboard uses the winning triple. Persist in config.py (section 3); "
+                "set MAD_GRID_SEARCH_STOCK / INDEX / SLEEVE all False to skip."
+            )
+        else:
+            print("\n[Multi-index allocator] single-config run (grid search disabled).")
+            metrics_mi, eval_df_mi = evaluate_mad_multi_index(
+                daily_long,
+                short_w=short_w_cfg,
+                long_w=long_w_cfg,
+                min_price=min_price,
+                min_history=min_hist,
+                fee_rate=float(args.fee_rate),
+                direction_mode=direction,
+                eval_dates=None,
+                bars_per_year_local=bpy,
+                exit_ma_period=exit_w_cfg,
+                granularity=gran,
+                aggregate_to_daily=daily_agg,
+            )
+        print("\nMulti-index backtest summary:")
+        print(f"  Net total return  : {metrics_mi['net_total_return']:+.2%}")
+        print(f"  Sharpe (annual)   : {metrics_mi['sharpe_ratio']:.2f}")
+        print(f"  Sortino (annual)  : {metrics_mi['sortino_ratio']:.2f}")
+        print(f"  Profit factor     : {metrics_mi['profit_factor']:.2f}")
+        print(f"  Bars (valid)      : {metrics_mi['bars']}")
+        print("  Per-slot contribution (standalone, no blend):")
+        _enabled_raw = getattr(config, "MAD_INDEX_ENABLED_ETFS", None)
+        _enabled_set = (
+            {str(t).strip().upper() for t in _enabled_raw if str(t).strip()}
+            if _enabled_raw
+            else None
+        )
+        for etf, _u, label in getattr(config, "MAD_INDEX_SLOTS", ()):
+            if _enabled_set is not None and etf.upper() not in _enabled_set:
+                continue  # slot disabled via MAD_INDEX_ENABLED_ETFS whitelist
+            ret_k = f"slot_{etf}_net_total_return"
+            shp_k = f"slot_{etf}_sharpe"
+            bars_k = f"slot_{etf}_bars"
+            status_k = f"slot_{etf}_status"
+            status = metrics_mi.get(status_k, None)
+            if ret_k in metrics_mi and status == "ok":
+                print(
+                    f"    {etf:4s} ({label:15s}): "
+                    f"return={metrics_mi[ret_k]:+.2%}  sharpe={metrics_mi[shp_k]:.2f}  "
+                    f"bars={int(metrics_mi.get(bars_k, 0))}"
+                )
+            elif status == "no_trades":
+                print(
+                    f"    {etf:4s} ({label:15s}): NO TRADES "
+                    f"(bars={int(metrics_mi.get(bars_k, 0))}, "
+                    f"return={metrics_mi.get(ret_k, 0.0):+.2%})"
+                )
+            elif status == "empty_universe":
+                print(
+                    f"    {etf:4s} ({label:15s}): SKIPPED "
+                    f"(exclusive universe empty after priority assignment)"
+                )
+            elif status == "empty_after_filter":
+                print(
+                    f"    {etf:4s} ({label:15s}): SKIPPED "
+                    f"(0 tickers survived MAD_MIN_DATA_COMPLETENESS filter)"
+                )
+            else:
+                # Defensive: unknown status — print whatever we have.
+                ret_val = metrics_mi.get(ret_k)
+                if ret_val is not None:
+                    print(
+                        f"    {etf:4s} ({label:15s}): "
+                        f"return={ret_val:+.2%}  sharpe={metrics_mi.get(shp_k, float('nan')):.2f}"
+                    )
+                else:
+                    print(f"    {etf:4s} ({label:15s}): (no metrics recorded)")
+
+        # Diagnostic: average realized top-level allocator weights across the
+        # full eval window. This is what the user actually sees "on average"
+        # — e.g. inv_vol with SPY+QQQ+IWM typically lands near 40/40/5 + risk-off.
+        try:
+            alloc_cols = [
+                c for c in eval_df_mi.columns
+                if c.startswith("alloc_")
+            ]
+            if alloc_cols:
+                avg = eval_df_mi[alloc_cols].mean(axis=0).sort_values(ascending=False)
+                print("\n  Average allocator weights over eval window:")
+                for col, v in avg.items():
+                    name = col.replace("alloc_", "")
+                    display = "risk-off sleeve" if name == "__risk_off__" else name
+                    print(f"    {display:18s}: {float(v):6.2%}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [avg-weights diagnostic skipped: {exc}]")
+
+        # Diagnostic: year-by-year decomposition. Reveals whether a flat stretch
+        # on the equity curve is driven by (a) risk-off dominance, (b) softmax
+        # whipsaw, or (c) a single leg (IWM) dragging. For each calendar year
+        # we show: strategy return, B&H return, avg allocator mix, # rebalances.
+        try:
+            df_yr = eval_df_mi.copy()
+            df_yr["year"] = df_yr.index.year
+            alloc_cols_yr = [c for c in df_yr.columns if c.startswith("alloc_")]
+            rows: list[str] = []
+            header = (
+                f"  {'Year':<6}{'Strat':>9}{'B&H':>9}{'ΔvsBH':>9}  "
+                + "".join(f"{c.replace('alloc_', '').replace('__risk_off__', 'RiskOff'):>9}"
+                          for c in alloc_cols_yr)
+                + f"  {'Rebal':>6}  {'Bars':>5}"
+            )
+            rows.append(header)
+            rows.append(f"  {'-' * (len(header) - 2)}")
+            for yr, g in df_yr.groupby("year"):
+                # Strategy realized log returns (NaN => excluded by valid mask).
+                s_log = g["net_log_return"].dropna()
+                bh_log = g["next_log_return"].dropna()
+                s_ret = float(np.expm1(s_log.sum())) if not s_log.empty else 0.0
+                bh_ret = float(np.expm1(bh_log.sum())) if not bh_log.empty else 0.0
+                rebals = int(g["flip"].fillna(False).sum())
+                alloc_avgs = [float(g[c].mean()) for c in alloc_cols_yr]
+                rows.append(
+                    f"  {int(yr):<6}{s_ret:>+8.2%} {bh_ret:>+8.2%} "
+                    f"{(s_ret - bh_ret):>+8.2%}  "
+                    + "".join(f"{v:>8.1%}" for v in alloc_avgs)
+                    + f"  {rebals:>6d}  {len(g):>5d}"
+                )
+            print("\n  Year-by-year decomposition:")
+            print("\n".join(rows))
+            # Quick diagnosis heuristic
+            flat_years = []
+            for yr, g in df_yr.groupby("year"):
+                s_log = g["net_log_return"].dropna()
+                if s_log.empty:
+                    continue
+                s_ret = float(np.expm1(s_log.sum()))
+                ro_col = next((c for c in alloc_cols_yr if c == "alloc___risk_off__"), None)
+                ro_avg = float(g[ro_col].mean()) if ro_col else 0.0
+                if abs(s_ret) < 0.10 and ro_avg < 0.5:
+                    flat_years.append(
+                        f"    {int(yr)}: {s_ret:+.2%} (risk-off avg only {ro_avg:.1%}; "
+                        f"stock-picker whipsaw or softmax concentration miss)"
+                    )
+                elif abs(s_ret) < 0.10 and ro_avg >= 0.5:
+                    flat_years.append(
+                        f"    {int(yr)}: {s_ret:+.2%} (risk-off avg {ro_avg:.1%}; "
+                        f"allocator parked in cash/bonds)"
+                    )
+            if flat_years:
+                print("\n  Flat-year diagnosis (|return| < 10%):")
+                print("\n".join(flat_years))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [year-by-year decomposition skipped: {exc}]")
+
+        # Diagnostic: per-year, per-ETF count of days each index failed its
+        # 200D trend filter. This is the DIRECT cause of risk-off rotation —
+        # if SPY/QQQ/IWM each fail ~N days in a given year, the allocator
+        # parks (N_failing / N_indexes) of the book in the risk-off sleeve
+        # on average. Useful for answering "why was 2021 39% risk-off when
+        # SPY/QQQ were up 28%?" → usually because IWM broke trend in Q4.
+        try:
+            trend_cols = [c for c in eval_df_mi.columns if c.startswith("trend_ok_")]
+            if trend_cols:
+                df_tr = eval_df_mi.copy()
+                df_tr["year"] = df_tr.index.year
+                hdr = (
+                    f"  {'Year':<6}{'Bars':>6}  "
+                    + "".join(
+                        f"{c.replace('trend_ok_', '') + ' fail%':>14}"
+                        for c in trend_cols
+                    )
+                )
+                lines: list[str] = [hdr, f"  {'-' * (len(hdr) - 2)}"]
+                for yr, g in df_tr.groupby("year"):
+                    n_bars = len(g)
+                    parts = []
+                    for c in trend_cols:
+                        fails = int((~g[c].astype(bool)).sum())
+                        pct = fails / n_bars if n_bars > 0 else 0.0
+                        parts.append(f"{fails:>4d} ({pct:>5.1%})")
+                    lines.append(
+                        f"  {int(yr):<6}{n_bars:>6d}  "
+                        + "".join(f"{p:>14}" for p in parts)
+                    )
+                print("\n  Trend-fail days per ETF per year "
+                      "(days below 200D SMA → drives risk-off rotation):")
+                print("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [trend-fail diagnostic skipped: {exc}]")
+
+        # Render the multi-index eval_df on the shared dashboard using
+        # ``combined_only=True`` (single "All non-warmup" view). We reuse the
+        # standard equity-curve + stats components; the sleeve / per-slot
+        # hover details are already embedded in ``eval_df_mi`` columns.
+        if not args.no_dashboard:
+            try:
+                mi_stats = comparison_stats_df(metrics_mi, eval_df_mi, bpy)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Multi-index] comparison_stats_df failed ({exc}); continuing with empty stats.")
+                mi_stats = pd.DataFrame()
+
+            mi_insight_lines = [
+                "Multi-index allocator (single-config run, grid search disabled).",
+                f"  MRAT {short_w_cfg}/{long_w_cfg}, regime MA {int(resolve_index_regime_ma(config) or 200)}, "
+                f"weighting scheme={getattr(config, 'MAD_INDEX_WEIGHTING_SCHEME', 'equal')!r}.",
+                "",
+                "Per-slot standalone contribution (no blend):",
+            ]
+            for etf, _u, label in getattr(config, "MAD_INDEX_SLOTS", ()):
+                if _enabled_set is not None and etf.upper() not in _enabled_set:
+                    continue  # slot disabled via MAD_INDEX_ENABLED_ETFS whitelist
+                ret_k = f"slot_{etf}_net_total_return"
+                shp_k = f"slot_{etf}_sharpe"
+                status = metrics_mi.get(f"slot_{etf}_status", "unknown")
+                if ret_k in metrics_mi and status == "ok":
+                    mi_insight_lines.append(
+                        f"  {etf} ({label}): return={metrics_mi[ret_k]:+.2%}  "
+                        f"sharpe={metrics_mi.get(shp_k, float('nan')):.2f}"
+                    )
+                else:
+                    mi_insight_lines.append(f"  {etf} ({label}): status={status}")
+            mi_insights = "\n".join(mi_insight_lines)
+
+            mi_results = {
+                AVG_KEY: {
+                    "eval_df": eval_df_mi,
+                    "metrics": metrics_mi,
+                    "stats_df": mi_stats,
+                    "label": "Multi-index blend (SPY+QQQ+IWM → risk-off)",
+                }
+            }
+            print(f"\nDashboard → http://127.0.0.1:{args.port}\n")
+            build_app(
+                mi_results,
+                pd.DataFrame(),  # no sweep_df for single-config run
+                mi_insights,
+                ref,
+                len(universe),
+                combined_only=True,
+                weight_banner=_format_weight_config_banner(wcfg),
+            ).run(debug=False, port=args.port)
+        return
+    # ----- End multi-index allocator dispatch ----------------------------------
 
     if eval_all:
         context = daily_long.copy()
@@ -1646,7 +3463,6 @@ def main() -> None:
                         long_w=lo_g,
                         min_price=min_price,
                         min_history=min_hist,
-                        min_names=min_names,
                         fee_rate=float(args.fee_rate),
                         direction_mode=direction,
                         eval_dates=all_research_dates,
@@ -1681,7 +3497,6 @@ def main() -> None:
             long_w=lo,
             min_price=min_price,
             min_history=min_hist,
-            min_names=min_names,
             fee_rate=float(args.fee_rate),
             direction_mode=direction,
             eval_dates=all_research_dates,
@@ -1788,6 +3603,7 @@ def main() -> None:
                 ref,
                 len(universe),
                 combined_only=True,
+                weight_banner=_format_weight_config_banner(wcfg),
             ).run(debug=False, port=args.port)
         return
 
@@ -1819,7 +3635,6 @@ def main() -> None:
                         long_w=lo,
                         min_price=min_price,
                         min_history=min_hist,
-                        min_names=min_names,
                         fee_rate=float(args.fee_rate),
                         direction_mode=direction,
                         eval_dates=eval_dset,
@@ -1854,7 +3669,6 @@ def main() -> None:
             long_w=lo,
             min_price=min_price,
             min_history=min_hist,
-            min_names=min_names,
             fee_rate=float(args.fee_rate),
             direction_mode=direction,
             eval_dates=eval_dset,
@@ -1933,7 +3747,6 @@ def main() -> None:
         long_w=best_lo,
         min_price=min_price,
         min_history=min_hist,
-        min_names=min_names,
         fee_rate=float(args.fee_rate),
         direction_mode=direction,
         eval_dates=eval_dset_combined,
@@ -2020,6 +3833,7 @@ def main() -> None:
             ref,
             len(universe),
             combined_only=False,
+            weight_banner=_format_weight_config_banner(wcfg),
         ).run(debug=False, port=args.port)
 
 
